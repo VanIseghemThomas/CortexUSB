@@ -43,7 +43,8 @@ jobs:
       - name: Push to NuGet.org
         run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
-      - name: Create a GitHub release
-        uses: ncipollo/release-action@v1
+      - name: Create Tag
+        uses: rickstaa/action-create-tag@v1
         with:
-          tag: ${{ steps.gen-version.version}}
+          tag: ${{ steps.gen-version.outputs.version }}
+          message: "Release ${{ steps.gen-version.outputs.full_version }}"
