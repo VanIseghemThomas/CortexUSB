@@ -1,10 +1,10 @@
 using System.Collections.Concurrent;
-using CortexUSB.Client;
-using CortexUSB.Models;
-using CortexUSB.Protocol;
+using OpenCortex.CortexUSB.Client;
+using OpenCortex.CortexUSB.Models;
+using OpenCortex.CortexUSB.Protocol;
 using CortexProtobufV2;
 
-namespace CortexUSB
+namespace OpenCortex.CortexUSB
 {
     /// <summary>
     /// High-level service for managing Quad Cortex protocol operations and state.

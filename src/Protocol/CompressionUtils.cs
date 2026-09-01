@@ -1,6 +1,6 @@
 using System.IO.Compression;
 
-namespace CortexUSB.Protocol
+namespace OpenCortex.CortexUSB.Protocol
 {
     public static class CompressionUtils
     {

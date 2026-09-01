@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace CortexUSB.Models
+namespace OpenCortex.CortexUSB.Models
 {
     /// <summary>
     /// Device information (firmware, serial, etc.)

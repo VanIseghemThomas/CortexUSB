@@ -1,19 +1,19 @@
 using System;
-using CortexUSB.Client;
+using OpenCortex.CortexUSB.Client;
 using Microsoft.Extensions.Logging;
 
 class Program
 {
     static void Main(string[] args)
     {
-        var devices = CortexUSB.UsbTransport.EnumerateDevices();
+        var devices = OpenCortex.CortexUSB.UsbTransport.EnumerateDevices();
         if (devices.Count == 0)
         {
             Console.WriteLine("No devices found.");
             return;
         }
 
-        using var transport = new CortexUSB.Client.UsbHidTransport();
+        using var transport = new OpenCortex.CortexUSB.Client.UsbHidTransport();
         var logger = new SimpleConsoleLogger<ProtocolClient>();
         using var client = new ProtocolClient(transport, logger: logger, fetchModelRepoInHandshake: false);
 

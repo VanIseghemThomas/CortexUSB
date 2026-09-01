@@ -2,7 +2,7 @@ using System;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics.CodeAnalysis;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     internal sealed class NullScope : IDisposable { public static NullScope Instance { get; } = new NullScope(); public void Dispose() { } }
 

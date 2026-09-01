@@ -2,7 +2,7 @@ using HidSharp;
 using System.Collections.Concurrent;
 using System.Linq;
 
-namespace CortexUSB
+namespace OpenCortex.CortexUSB
 {
     /// <summary>
     /// Pure .NET USB HID transport for Quad Cortex using HidSharp library.

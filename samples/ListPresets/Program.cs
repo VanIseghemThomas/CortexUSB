@@ -1,21 +1,21 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using CortexUSB.Client;
+using OpenCortex.CortexUSB.Client;
 using CortexProtobufV2;
 
 class Program
 {
     static void Main(string[] args)
     {
-        var devices = CortexUSB.UsbTransport.EnumerateDevices();
+        var devices = OpenCortex.CortexUSB.UsbTransport.EnumerateDevices();
         if (devices.Count == 0)
         {
             Console.WriteLine("No devices found.");
             return;
         }
 
-        using var transport = new CortexUSB.Client.UsbHidTransport();
+        using var transport = new OpenCortex.CortexUSB.Client.UsbHidTransport();
         using var client = new ProtocolClient(transport, fetchModelRepoInHandshake: true);
 
         Console.WriteLine("Connecting...");

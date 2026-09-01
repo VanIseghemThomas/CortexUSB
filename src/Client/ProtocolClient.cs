@@ -1,12 +1,12 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
-using CortexUSB.Models;
-using CortexUSB.Protocol;
+using OpenCortex.CortexUSB.Models;
+using OpenCortex.CortexUSB.Protocol;
 using CortexProtobufV2;
 using Google.Protobuf;
 using Microsoft.Extensions.Logging;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     /// <summary>
     /// High-level client that exposes domain actions using ITransport.

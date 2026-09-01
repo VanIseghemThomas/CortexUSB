@@ -3,6 +3,7 @@
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>CortexUSB</PackageId>
+    <RootNamespace>OpenCortex.CortexUSB</RootNamespace>
     <Description>USB HID / protocol client library for the Neural DSP Quad Cortex.</Description>
   </PropertyGroup>
 
@@ -29,7 +30,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="../../README.md" Pack="true" PackagePath="\" />
+    <None Include="../README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

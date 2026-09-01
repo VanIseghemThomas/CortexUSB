@@ -1,7 +1,7 @@
 using System;
 using System.Security.Cryptography;
 
-namespace CortexUSB.Client.Encryption
+namespace OpenCortex.CortexUSB.Client.Encryption
 {
     public static class AesGcmHelper
     {

@@ -21,7 +21,7 @@ dotnet add package CortexUSB
 ## Quick start
 
 ```csharp
-using CortexUSB;
+using OpenCortex.CortexUSB;
 
 using var cortex = new QuadCortex();
 if (await cortex.ConnectAsync())

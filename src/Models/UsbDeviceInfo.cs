@@ -1,4 +1,4 @@
-namespace CortexUSB
+namespace OpenCortex.CortexUSB
 {
     /// <summary>
     /// Information about a discovered USB HID device.

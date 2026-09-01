@@ -2,7 +2,7 @@ using System.Text;
 using Google.Protobuf;
 using CortexProtobufV2;
 
-namespace CortexUSB.Protocol
+namespace OpenCortex.CortexUSB.Protocol
 {
     /// <summary>
     /// Protobuf message encoding utilities for building protocol messages.

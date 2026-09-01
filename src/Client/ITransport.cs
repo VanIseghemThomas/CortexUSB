@@ -1,6 +1,6 @@
 using System;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     /// <summary>
     /// Abstraction for a transport that can send and receive 129-byte HID reports.

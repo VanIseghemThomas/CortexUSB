@@ -1,4 +1,4 @@
-namespace CortexUSB.Models
+namespace OpenCortex.CortexUSB.Models
 {
     // ─── Lightweight state summary for callers (excludes heavy collections) ─────
 

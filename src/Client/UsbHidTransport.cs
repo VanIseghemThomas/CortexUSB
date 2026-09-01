@@ -1,7 +1,7 @@
 using System;
-using CortexUSB;
+using OpenCortex.CortexUSB;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     /// <summary>
     /// Thin adapter that implements ITransport by delegating to existing UsbTransport.

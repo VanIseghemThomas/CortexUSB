@@ -1,10 +1,10 @@
 using System.IO;
 using System.Text;
 using System.Xml;
-using CortexUSB.Models;
+using OpenCortex.CortexUSB.Models;
 using CortexProtobufV2;
 
-namespace CortexUSB.Protocol
+namespace OpenCortex.CortexUSB.Protocol
 {
     public static class ModelCatalog
     {

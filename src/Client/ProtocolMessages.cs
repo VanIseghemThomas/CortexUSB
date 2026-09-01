@@ -1,7 +1,7 @@
 using CortexProtobufV2;
 using Google.Protobuf;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     public static class ProtocolMessages
     {

@@ -1,6 +1,6 @@
 using Serilog;
 
-namespace CortexUSB.Logging
+namespace OpenCortex.CortexUSB.Logging
 {
     public static class LogHelper
     {

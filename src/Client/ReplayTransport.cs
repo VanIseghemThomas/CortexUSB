@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using System.Threading;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     /// <summary>
     /// Transport for tests that replays pre-recorded 129-byte HID reports.

@@ -5,7 +5,7 @@ using System.Threading;
 using System;
 using System.Collections.Generic;
 
-namespace CortexUSB.Client
+namespace OpenCortex.CortexUSB.Client
 {
     public class WirePayload
     {

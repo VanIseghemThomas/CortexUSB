@@ -1,6 +1,6 @@
 using System;
 
-namespace CortexUSB.Client.Encryption
+namespace OpenCortex.CortexUSB.Client.Encryption
 {
     // Minimal XXTEA implementation for decrypting key_material blobs from device.
     // This matches the simple reference XXTEA algorithm (block cipher operating on

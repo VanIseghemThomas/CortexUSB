@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/CortexUSB/CortexUSB.csproj" />
+    <ProjectReference Include="..\..\src\CortexUSB.csproj" />
   </ItemGroup>
 
 </Project>

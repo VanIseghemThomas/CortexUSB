@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace CortexUSB
+namespace OpenCortex.CortexUSB
 {
     /// <summary>
     /// Assembles chunked HID reports into complete wire messages.
