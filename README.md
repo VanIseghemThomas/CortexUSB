@@ -10,6 +10,12 @@ editing.
 (state caching, preset library, grid editing) and exposes only clean
 domain types. No protobuf, wire, or HID types leak out of it.
 
+## Usage
+
+```
+dotnet add package CortexUSB
+```
+
 ## Architecture
 
 - **`Client/`** — transport (`ITransport`, `UsbHidTransport`, `ReplayTransport`
