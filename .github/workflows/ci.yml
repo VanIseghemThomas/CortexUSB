@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore CortexUSB.sln
+
+      - name: Build
+        run: dotnet build CortexUSB.sln --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test CortexUSB.sln --no-build --configuration Release
+
+      - name: Pack (validation only)
+        run: dotnet pack src/CortexUSB/CortexUSB.csproj --no-build --configuration Release --output /tmp/nupkg
