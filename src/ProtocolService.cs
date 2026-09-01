@@ -701,6 +701,229 @@ namespace OpenCortex.CortexUSB
         }
 
         /// <summary>
+        /// Renames a scene (0-7) by sending a SceneLabel message (type 23).
+        /// The device echoes a RecallPreset carrying the updated scene_labels.
+        /// </summary>
+        public async Task<bool> SetSceneLabelAsync(int index, string label)
+        {
+            if (!_isConnected)
+            {
+                _logger.LogWarning("[ProtocolService] Cannot set scene label - not connected");
+                return false;
+            }
+
+            if (index < 0 || index > 7)
+            {
+                _logger.LogWarning("[ProtocolService] Invalid scene index {Index} (must be 0-7)", index);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                _logger.LogWarning("[ProtocolService] Scene label must not be empty");
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Setting scene {Index} label to '{Label}'...", index, label);
+
+                byte[] message = ProtobufBuilder.BuildSceneLabelMessage(index, label);
+                if (!SendCommand(message, MessageTypes.SceneLabel))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send scene label message");
+                    return false;
+                }
+
+                // The device echoes a RecallPreset with updated scene_labels.
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.RecallPreset,
+                    null,
+                    TimeSpan.FromSeconds(3));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Scene label sent but no RecallPreset echo within 3s");
+                    return false;
+                }
+
+                // Re-parse the preset to pick up the updated labels.
+                BinaryPreset? preset = ParseRecallPreset(echo.Payload);
+                if (preset != null)
+                {
+                    lock (_stateLock)
+                    {
+                        PresetDetails? details = BuildPresetDetails(preset);
+                        _currentState = _currentState with
+                        {
+                            PresetDetails = details,
+                            Timestamp = DateTime.UtcNow
+                        };
+                    }
+                }
+
+                _logger.LogInformation("[ProtocolService] Scene {Index} renamed to '{Label}'", index, label);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "sceneLabel"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Copies scene state from one slot to another (overwriting the destination).
+        /// Sends a SceneCopy message (type 22).
+        /// </summary>
+        public async Task<bool> CopySceneAsync(int fromIndex, int toIndex)
+        {
+            return await CopyOrSwapSceneAsync(fromIndex, toIndex, isSwap: false);
+        }
+
+        /// <summary>
+        /// Swaps the state of two scenes.
+        /// Sends a SceneCopy message (type 22) with is_swap=true.
+        /// </summary>
+        public async Task<bool> SwapScenesAsync(int indexA, int indexB)
+        {
+            return await CopyOrSwapSceneAsync(indexA, indexB, isSwap: true);
+        }
+
+        private async Task<bool> CopyOrSwapSceneAsync(int fromIndex, int toIndex, bool isSwap)
+        {
+            if (!_isConnected)
+            {
+                _logger.LogWarning("[ProtocolService] Cannot {Action} scenes - not connected", isSwap ? "swap" : "copy");
+                return false;
+            }
+
+            if (fromIndex < 0 || fromIndex > 7 || toIndex < 0 || toIndex > 7)
+            {
+                _logger.LogWarning("[ProtocolService] Invalid scene index (must be 0-7): from={From}, to={To}", fromIndex, toIndex);
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                string action = isSwap ? "Swapping" : "Copying";
+                _logger.LogDebug("[ProtocolService] {Action} scene {From} -> {To}...", action, fromIndex, toIndex);
+
+                byte[] message = ProtobufBuilder.BuildSceneCopyMessage(fromIndex, toIndex, isSwap);
+                if (!SendCommand(message, MessageTypes.SceneCopy))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send scene {Action} message", isSwap ? "swap" : "copy");
+                    return false;
+                }
+
+                // The device echoes a RecallPreset after modifying scene data.
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.RecallPreset,
+                    null,
+                    TimeSpan.FromSeconds(3));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Scene {Action} sent but no RecallPreset echo within 3s", isSwap ? "swap" : "copy");
+                    return false;
+                }
+
+                BinaryPreset? preset = ParseRecallPreset(echo.Payload);
+                if (preset != null)
+                {
+                    lock (_stateLock)
+                    {
+                        PresetDetails? details = BuildPresetDetails(preset);
+                        _currentState = _currentState with
+                        {
+                            PresetDetails = details,
+                            Timestamp = DateTime.UtcNow
+                        };
+                    }
+                }
+
+                _logger.LogInformation("[ProtocolService] Scenes {From} <-> {To} {Action} complete", fromIndex, toIndex, isSwap ? "swapped" : "copied");
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "sceneCopy"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sets a scene's color via a SceneColor message (type 48).
+        /// Color is an unsigned 32-bit ARGB value (e.g. 0xFFFF0000 for opaque red).
+        /// </summary>
+        public async Task<bool> SetSceneColorAsync(int index, uint color)
+        {
+            if (!_isConnected)
+            {
+                _logger.LogWarning("[ProtocolService] Cannot set scene color - not connected");
+                return false;
+            }
+
+            if (index < 0 || index > 7)
+            {
+                _logger.LogWarning("[ProtocolService] Invalid scene index {Index} (must be 0-7)", index);
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Setting scene {Index} color to 0x{Color:X8}...", index, color);
+
+                byte[] message = ProtobufBuilder.BuildSceneColorMessage(index, color);
+                if (!SendCommand(message, MessageTypes.SceneColor))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send scene color message");
+                    return false;
+                }
+
+                // The device echoes a RecallPreset with updated scene_colors.
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.RecallPreset,
+                    null,
+                    TimeSpan.FromSeconds(3));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Scene color sent but no RecallPreset echo within 3s");
+                    return false;
+                }
+
+                BinaryPreset? preset = ParseRecallPreset(echo.Payload);
+                if (preset != null)
+                {
+                    lock (_stateLock)
+                    {
+                        PresetDetails? details = BuildPresetDetails(preset);
+                        _currentState = _currentState with
+                        {
+                            PresetDetails = details,
+                            Timestamp = DateTime.UtcNow
+                        };
+                    }
+                }
+
+                _logger.LogInformation("[ProtocolService] Scene {Index} color set to 0x{Color:X8}", index, color);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "sceneColor"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
         /// Sets the device mode (0=Preset, 1=Scene, 2=Stomp).
         /// </summary>
         public async Task<bool> SetModeAsync(int mode)
@@ -2345,7 +2568,8 @@ namespace OpenCortex.CortexUSB
                 Uuid = preset.AuthorId ?? string.Empty,
                 Created = preset.Date ?? string.Empty,
                 FwVersion = preset.CreatedVersion.FirstOrDefault() ?? string.Empty,
-                Scenes = preset.SceneLabels.ToList()
+                Scenes = preset.SceneLabels.ToList(),
+                SceneColors = preset.SceneColors.ToList()
             };
         }
 

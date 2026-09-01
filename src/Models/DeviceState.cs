@@ -66,6 +66,9 @@ namespace OpenCortex.CortexUSB.Models
 
         [JsonPropertyName("scenes")]
         public List<string> Scenes { get; init; } = [];
+
+        [JsonPropertyName("sceneColors")]
+        public List<uint> SceneColors { get; init; } = [];
     }
 
     public record GridRow
@@ -417,11 +420,14 @@ namespace OpenCortex.CortexUSB.Models
         public const uint Mode = 14;
         public const uint RecallPreset = 15;
         public const uint MasterVolume = 17;
+        public const uint SceneCopy = 22;
+        public const uint SceneLabel = 23;
         public const uint ShowTuner = 27;
         public const uint KeepAlive = 32;
         public const uint Tempo = 33;
         public const uint PresetDirty = 34; // Device→Host - Preset has unsaved changes
         public const uint GlobalEQ = 38;
+        public const uint SceneColor = 48;
         public const uint Connection = 49;
         public const uint NewModels = 50; // Device→Host - new model IDs registered (e.g. a Capture was saved); re-fetch ModelRepo
         public const uint ModelRepo = 51;

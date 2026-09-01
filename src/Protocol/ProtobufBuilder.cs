@@ -537,6 +537,72 @@ namespace OpenCortex.CortexUSB.Protocol
             return message.ToByteArray();
         }
 
+        // ─── Scene management ───────────────────────────────────────────
+
+        /// <summary>
+        /// Build a SceneLabel message (type 23) renaming a scene.
+        /// Format: SceneLabelMessage { action=UPDATE, index=0-7, label="name" }
+        /// </summary>
+        public static byte[] BuildSceneLabelMessage(int index, string label)
+        {
+            if (index < 0 || index > 7)
+                throw new ArgumentOutOfRangeException(nameof(index), "Scene index must be 0-7");
+            if (string.IsNullOrWhiteSpace(label))
+                throw new ArgumentException("Scene label must not be empty", nameof(label));
+
+            SceneLabelMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Update,
+                Index = index,
+                Label = label
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a SceneCopy message (type 22) copying or swapping scenes.
+        /// Format: SceneCopyMessage { action=COPY, from_index, to_index, is_swap }
+        /// Use is_swap=false for a copy (dest overwritten), is_swap=true for a swap.
+        /// </summary>
+        public static byte[] BuildSceneCopyMessage(int fromIndex, int toIndex, bool isSwap)
+        {
+            if (fromIndex < 0 || fromIndex > 7)
+                throw new ArgumentOutOfRangeException(nameof(fromIndex), "Scene index must be 0-7");
+            if (toIndex < 0 || toIndex > 7)
+                throw new ArgumentOutOfRangeException(nameof(toIndex), "Scene index must be 0-7");
+
+            SceneCopyMessage message = new()
+            {
+                Action = isSwap ? MessageAction.Types.Enum.Swap : MessageAction.Types.Enum.Copy,
+                FromIndex = fromIndex,
+                ToIndex = toIndex,
+                IsSwap = isSwap
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a SceneColor message (type 48) setting a scene's color.
+        /// Format: SceneColorMessage { action=UPDATE, index=0-7, color=ARGB }
+        /// Color is an unsigned 32-bit ARGB value (e.g. 0xFFFF0000 for opaque red).
+        /// </summary>
+        public static byte[] BuildSceneColorMessage(int index, uint color)
+        {
+            if (index < 0 || index > 7)
+                throw new ArgumentOutOfRangeException(nameof(index), "Scene index must be 0-7");
+
+            SceneColorMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Update,
+                Index = index,
+                Color = color
+            };
+
+            return message.ToByteArray();
+        }
+
         // Legacy manual encoding helpers removed — use generated protobuf message classes instead.
     }
 }

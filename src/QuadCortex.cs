@@ -54,6 +54,18 @@ namespace OpenCortex.CortexUSB
         public Task<bool> SetSceneAsync(int sceneIndex)
             => _service.SetSceneAsync(sceneIndex);
 
+        public Task<bool> SetSceneLabelAsync(int index, string label)
+            => _service.SetSceneLabelAsync(index, label);
+
+        public Task<bool> CopySceneAsync(int fromIndex, int toIndex)
+            => _service.CopySceneAsync(fromIndex, toIndex);
+
+        public Task<bool> SwapScenesAsync(int indexA, int indexB)
+            => _service.SwapScenesAsync(indexA, indexB);
+
+        public Task<bool> SetSceneColorAsync(int index, uint color)
+            => _service.SetSceneColorAsync(index, color);
+
         public Task<bool> SetModeAsync(int mode)
             => _service.SetModeAsync(mode);
 
