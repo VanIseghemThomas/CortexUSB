@@ -2,31 +2,63 @@ name: Publish to NuGet
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write 
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Derive version from tag
-        run: echo "PACKAGE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Generate version
+        id: gen-version
+        run: |
+          ./tools/gen-version.sh
+          echo "Version: ${{ steps.gen-version.outputs.version }} (${{ steps.gen-version.outputs.short_sha }})"
 
       - name: Restore
         run: dotnet restore CortexUSB.sln
 
       - name: Build
-        run: dotnet build CortexUSB.sln --no-restore --configuration Release -p:Version=${{ env.PACKAGE_VERSION }}
+        run: dotnet build CortexUSB.sln --no-restore --configuration Release -p:Version=${{ steps.gen-version.outputs.version }} -p:InformationalVersion=${{ steps.gen-version.outputs.full_version }}
 
       - name: Pack
-        run: dotnet pack src/CortexUSB.csproj --no-build --configuration Release -p:Version=${{ env.PACKAGE_VERSION }} --output ./nupkg
+        run: dotnet pack src/CortexUSB.csproj --no-build --configuration Release -p:Version=${{ steps.gen-version.outputs.version }} -p:InformationalVersion=${{ steps.gen-version.outputs.full_version }} --output ./nupkg
 
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
       - name: Push to NuGet.org
-        run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Tag commit
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="v${{ steps.gen-version.outputs.version }}"
+          echo "Tagging commit ${{ steps.gen-version.outputs.short_sha }} as $TAG"
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
+            echo "Tag $TAG already exists on remote, skipping."
+            exit 0
+          fi
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally, skipping creation."
+          else
+            git tag -a "$TAG" -m "Release $TAG (${{ steps.gen-version.outputs.full_version }})"
+          fi
+          git push origin "$TAG"
