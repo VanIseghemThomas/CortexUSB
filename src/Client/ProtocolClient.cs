@@ -177,14 +177,14 @@ namespace OpenCortex.CortexUSB.Client
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolClient] Extract key_material failed: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolClient] Extract key_material failed");
             }
         }
 
         private void SendMessageSafe(byte[] payload, uint messageType, string errorMessage)
         {
             try { SendWireMessage(payload, messageType); }
-            catch (Exception ex) { Console.WriteLine($"[ProtocolClient] {errorMessage}: {ex.Message}"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[ProtocolClient] {ErrorMessage}", errorMessage); }
         }
 
         private void StartBackgroundReader()
@@ -198,24 +198,24 @@ namespace OpenCortex.CortexUSB.Client
         {
             if (!_fetchModelRepoInHandshake) return;
 
-            Console.WriteLine("[ProtocolClient] Waiting for ModelRepo response...");
+            _logger.LogDebug("[ProtocolClient] Waiting for ModelRepo response...");
             WirePayload? modelRepo = WaitForMessage(51, TimeSpan.FromSeconds(15));
             if (modelRepo != null)
             {
                 _lastModelRepoSize = modelRepo.Payload.Length;
                 _lastModelRepoAt = DateTime.UtcNow;
-                Console.WriteLine($"[ProtocolClient] ✅ ModelRepo received: {modelRepo.Payload.Length} bytes");
+                _logger.LogDebug("[ProtocolClient] ModelRepo received: {Bytes} bytes", modelRepo.Payload.Length);
             }
             else
             {
-                Console.WriteLine("[ProtocolClient] ⚠️ ModelRepo not received within timeout, continuing anyway");
+                _logger.LogWarning("[ProtocolClient] ModelRepo not received within timeout, continuing anyway");
             }
         }
 
         private void StartKeepAlive()
         {
             _keepAliveTimer = new Timer(SendKeepAlive, null, TimeSpan.FromMilliseconds(800), TimeSpan.FromMilliseconds(800));
-            Console.WriteLine("[ProtocolClient] ✅ KeepAlive started (800ms interval)");
+            _logger.LogDebug("[ProtocolClient] KeepAlive started (800ms interval)");
         }
 
         private const int StallTimeoutMs = 15_000;
@@ -234,7 +234,7 @@ namespace OpenCortex.CortexUSB.Client
                         // No report this cycle — check for USB stall
                         if (_connected && (DateTime.UtcNow - lastReportAt).TotalMilliseconds > StallTimeoutMs)
                         {
-                            Console.WriteLine($"[ProtocolClient] ❌ USB stall detected — no data for {StallTimeoutMs / 1000}s, marking disconnected");
+                            _logger.LogWarning("[ProtocolClient] USB stall detected — no data for {StallTimeoutSec}s, marking disconnected", StallTimeoutMs / 1000);
                             HandleConnectionLost("USB stall — no data received for " + StallTimeoutMs / 1000 + "s");
                             return;
                         }
@@ -250,7 +250,7 @@ namespace OpenCortex.CortexUSB.Client
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("[ProtocolClient] ReaderLoop error: " + ex.Message);
+                    _logger.LogWarning(ex, "[ProtocolClient] ReaderLoop error");
                     Thread.Sleep(20);
                 }
             }
@@ -278,7 +278,7 @@ namespace OpenCortex.CortexUSB.Client
             catch (Exception ex) { _logger.LogWarning(ex, "[ProtocolClient] Parse RecallPreset failed"); }
         }
 
-        private static void TryParseGlobalTempo(WirePayload w)
+        private void TryParseGlobalTempo(WirePayload w)
         {
             try
             {
@@ -286,7 +286,7 @@ namespace OpenCortex.CortexUSB.Client
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[ProtocolClient] Parse GlobalTempo failed: " + ex.Message);
+                _logger.LogWarning(ex, "[ProtocolClient] Parse GlobalTempo failed");
             }
         }
 
@@ -443,18 +443,18 @@ namespace OpenCortex.CortexUSB.Client
                         }
 
                         if (fmResp.Folder.Files.Any(f => f.Name == "integration-test"))
-                            Console.WriteLine("[ProtocolClient] Found integration-test in file list");
+                            _logger.LogDebug("[ProtocolClient] Found integration-test in file list");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ProtocolClient] Failed to parse FileMessage: {ex.Message}");
+                    _logger.LogWarning(ex, "[ProtocolClient] Failed to parse FileMessage");
                 }
             }
             // After collecting file messages, wait for an idle window to ensure large transfers finished
             if (!WaitForIdle(TimeSpan.FromMilliseconds(_idleMsBeforeAction), TimeSpan.FromSeconds(5), 4, 51))
             {
-                Console.WriteLine("[ProtocolClient] Warning: Did not reach idle after file list within 5s");
+                _logger.LogWarning("[ProtocolClient] Did not reach idle after file list within 5s");
             }
             return list;
         }
@@ -472,7 +472,7 @@ namespace OpenCortex.CortexUSB.Client
                 // Wait for any streaming FileMessage chunks to finish
                 if (!WaitForIdle(TimeSpan.FromMilliseconds(_idleMsBeforeAction), TimeSpan.FromSeconds(10), 4))
                 {
-                    Console.WriteLine("[ProtocolClient] Warning: ModelRepo may still be streaming file messages (idle timeout)");
+                    _logger.LogWarning("[ProtocolClient] ModelRepo may still be streaming file messages (idle timeout)");
                 }
             }
             return w?.Payload;
@@ -517,7 +517,7 @@ namespace OpenCortex.CortexUSB.Client
         {
             if (!WaitForIdle(TimeSpan.FromMilliseconds(_idleMsBeforeAction), TimeSpan.FromSeconds(5), 4, 51))
             {
-                Console.WriteLine("[ProtocolClient] Warning: Not idle before RecallPreset - proceeding anyway");
+                _logger.LogWarning("[ProtocolClient] Not idle before RecallPreset - proceeding anyway");
             }
 
             SendMessageSafe(new FileMessage { Action = MessageAction.Types.Enum.Read }.ToByteArray(), 4, "Failed to send File listing request");
@@ -525,7 +525,7 @@ namespace OpenCortex.CortexUSB.Client
             PresetLocation loc = FindPresetInFileListings(name, timeout);
             if (loc.FolderKey == null || loc.PresetIndex < 0)
             {
-                Console.WriteLine($"[ProtocolClient] Could not find preset '{name}' in file listings");
+                _logger.LogWarning("[ProtocolClient] Could not find preset '{Name}' in file listings", name);
                 return false;
             }
 
@@ -539,7 +539,7 @@ namespace OpenCortex.CortexUSB.Client
         {
             if (!WaitForIdle(TimeSpan.FromMilliseconds(_idleMsBeforeAction), TimeSpan.FromSeconds(5), 4, 51))
             {
-                Console.WriteLine("[ProtocolClient] Warning: Not idle before FindPresetByPath - proceeding anyway");
+                _logger.LogWarning("[ProtocolClient] Not idle before FindPresetByPath - proceeding anyway");
             }
 
             SendMessageSafe(new FileMessage { Action = MessageAction.Types.Enum.Read }.ToByteArray(), 4, "Failed to send File listing request");
@@ -557,13 +557,13 @@ namespace OpenCortex.CortexUSB.Client
                 {
                     if (string.Equals(f.Key, presetPath, StringComparison.OrdinalIgnoreCase))
                     {
-                        Console.WriteLine($"[ProtocolClient] Found preset path '{presetPath}': key='{fmResp.Folder.Key}', index={f.Index}");
+                        _logger.LogDebug("[ProtocolClient] Found preset path '{PresetPath}': key='{Key}', index={Index}", presetPath, fmResp.Folder.Key, f.Index);
                         return new PresetLocation(fmResp.Folder.Key ?? string.Empty, f.Index, fmResp.Folder.IsFactory);
                     }
                 }
             }
 
-            Console.WriteLine($"[ProtocolClient] Could not find preset path '{presetPath}' in file listings");
+            _logger.LogWarning("[ProtocolClient] Could not find preset path '{PresetPath}' in file listings", presetPath);
             return new PresetLocation(null, -1, false);
         }
 
@@ -589,12 +589,12 @@ namespace OpenCortex.CortexUSB.Client
             return new PresetLocation(null, -1, false);
         }
 
-        private static FileMessage? TryParseFileMessage(WirePayload w)
+        private FileMessage? TryParseFileMessage(WirePayload w)
         {
             try { return FileMessage.Parser.ParseFrom(w.Payload); }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine("[ProtocolClient] Failed to parse FileMessage");
+                _logger.LogWarning(ex, "[ProtocolClient] Failed to parse FileMessage");
                 return null;
             }
         }
@@ -612,9 +612,9 @@ namespace OpenCortex.CortexUSB.Client
                 RecallPresetMessage rpResp = RecallPresetMessage.Parser.ParseFrom(resp.Payload);
                 return rpResp.Preset != null && rpResp.Preset.Name == name;
             }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolClient] RecallPreset response parse failed");
+                _logger.LogWarning(ex, "[ProtocolClient] RecallPreset response parse failed");
                 return false;
             }
         }
@@ -631,7 +631,7 @@ namespace OpenCortex.CortexUSB.Client
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolClient] ⚠️ KeepAlive failed: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolClient] KeepAlive failed");
             }
         }
 
@@ -654,7 +654,7 @@ namespace OpenCortex.CortexUSB.Client
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[ProtocolClient] ListFiles parse failed: {ex.Message}");
+                        _logger.LogWarning(ex, "[ProtocolClient] ListFiles parse failed");
                     }
                 }
             }
@@ -686,7 +686,7 @@ namespace OpenCortex.CortexUSB.Client
             _readerThread = null;
 
             try { _transport.Close(); }
-            catch (Exception ex) { Console.WriteLine($"[ProtocolClient] Transport close on connection loss failed: {ex.Message}"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[ProtocolClient] Transport close on connection loss failed"); }
 
             _byType.Clear();
             _lastRecallPreset = null;
@@ -710,7 +710,7 @@ namespace OpenCortex.CortexUSB.Client
             _cts = null;
 
             try { _readerThread?.Join(1000); }
-            catch (Exception ex) { Console.WriteLine($"[ProtocolClient] Reader thread join failed: {ex.Message}"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[ProtocolClient] Reader thread join failed"); }
             _readerThread = null;
 
             _byType.Clear();
@@ -719,7 +719,7 @@ namespace OpenCortex.CortexUSB.Client
             _aesIv = null;
             _assembler.Reset();
 
-            Console.WriteLine("[ProtocolClient] Disconnected");
+            _logger.LogInformation("[ProtocolClient] Disconnected");
         }
 
         public void Dispose()
@@ -743,14 +743,14 @@ namespace OpenCortex.CortexUSB.Client
         // Produce a short summary of diagnostic counts/timestamps for the last run
         public void PrintRunSummary()
         {
-            Console.WriteLine("[ProtocolClient] --- Run Summary ---");
-            Console.WriteLine($"[ProtocolClient] ModelRepo: size={_lastModelRepoSize} bytes, at={_lastModelRepoAt}");
-            Console.WriteLine("[ProtocolClient] Message counts:");
+            _logger.LogDebug("[ProtocolClient] --- Run Summary ---");
+            _logger.LogDebug("[ProtocolClient] ModelRepo: size={Size} bytes, at={At}", _lastModelRepoSize, _lastModelRepoAt);
+            _logger.LogDebug("[ProtocolClient] Message counts:");
             foreach (KeyValuePair<uint, long> kv in _messageCounts)
             {
-                Console.WriteLine($"  type={kv.Key} count={kv.Value} lastAt={(_lastMessageAt.TryGetValue(kv.Key, out DateTime t) ? t.ToString() : "never")}");
+                _logger.LogDebug("[ProtocolClient] type={Type} count={Count} lastAt={LastAt}", kv.Key, kv.Value, _lastMessageAt.TryGetValue(kv.Key, out DateTime t) ? t.ToString() : "never");
             }
-            Console.WriteLine("[ProtocolClient] ---------------------");
+            _logger.LogDebug("[ProtocolClient] ---------------------");
         }
     }
 }

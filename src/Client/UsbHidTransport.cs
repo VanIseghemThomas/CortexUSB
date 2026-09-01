@@ -1,4 +1,5 @@
 using System;
+using Microsoft.Extensions.Logging;
 using OpenCortex.CortexUSB;
 
 namespace OpenCortex.CortexUSB.Client
@@ -10,8 +11,13 @@ namespace OpenCortex.CortexUSB.Client
     /// </summary>
     public class UsbHidTransport : ITransport
     {
-        private readonly UsbTransport _inner = new();
+        private readonly UsbTransport _inner;
         private bool _disposed;
+
+        public UsbHidTransport(ILogger<UsbTransport>? logger = null)
+        {
+            _inner = new UsbTransport(logger);
+        }
 
         public bool Open() => _inner.Open();
 

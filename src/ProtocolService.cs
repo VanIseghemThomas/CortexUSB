@@ -3,18 +3,21 @@ using OpenCortex.CortexUSB.Client;
 using OpenCortex.CortexUSB.Models;
 using OpenCortex.CortexUSB.Protocol;
 using CortexProtobufV2;
+using Microsoft.Extensions.Logging;
 
 namespace OpenCortex.CortexUSB
 {
     /// <summary>
     /// High-level service for managing Quad Cortex protocol operations and state.
-    /// Provides thread-safe operations and state caching for WebSocket API.
+    /// Provides thread-safe operations and state caching
     /// </summary>
     public class ProtocolService : IDisposable
     {
         private sealed record ParsedFolder(string Path, string Name, List<PresetEntry> Presets);
         private sealed record ChainIO(string Input, string Output, int InPortId, int OutPortId);
         private sealed record NamedRoot(string Path, string Name);
+        private sealed record ParamWrite(int Offset, float Value);
+        private sealed record ChainBlocksResult(List<Block> Blocks, List<SplitInfo> Splits);
 
         // Mirrors WebCortex/src/types/PortEnums.ts — in_portid/out_portid are raw device
         // enum values (pyquadcortex protocol.enums.Input/Output), not something we can
@@ -65,6 +68,7 @@ namespace OpenCortex.CortexUSB
             [22] = "USB 3/4",
         };
         private readonly ProtocolClient _client;
+        private readonly ILogger<ProtocolService> _logger;
         private readonly ConcurrentQueue<WirePayload> _incomingMessages;
         private readonly CancellationTokenSource _cts;
         private readonly Thread? _messageProcessorThread;
@@ -127,7 +131,7 @@ namespace OpenCortex.CortexUSB
             }
             try
             {
-                Console.WriteLine("[ProtocolService] 🔥 FORCING fresh PRESET AND SCENE state query from device...");
+                _logger.LogDebug("[ProtocolService] Forcing fresh preset and scene state query from device...");
 
                 // These four queries are each a blocking wait (3-5s worst case) on
                 // its own message type. Run them concurrently instead of one after
@@ -142,12 +146,12 @@ namespace OpenCortex.CortexUSB
                         (payload) => { int s = ParseSceneMessage(payload); return s >= 0 ? s : (int?)null; },
                         (state, val) => val != state.Scene,
                         (state, val, ts) => state with { Scene = val, Timestamp = ts },
-                        (val) => Console.WriteLine($"[ProtocolService] ✅ Scene: {val}"))),
+                        (val) => _logger.LogDebug("[ProtocolService] Scene: {Scene}", val))),
                     Task.Run(() => QueryAndUpdateStateField(MessageTypes.Mode, "Mode",
                         (payload) => { int m = ParseModeMessage(payload); return m >= 0 ? m : (int?)null; },
                         (state, val) => val != state.Mode,
                         (state, val, ts) => state with { Mode = val, Timestamp = ts },
-                        (val) => Console.WriteLine($"[ProtocolService] ✅ Mode: {DeviceMode.GetModeName(val)}")))
+                        (val) => _logger.LogDebug("[ProtocolService] Mode: {Mode}", DeviceMode.GetModeName(val))))
                 );
                 bool anyUpdated = updated.Any(u => u);
                 if (_currentPreset != null)
@@ -162,11 +166,12 @@ namespace OpenCortex.CortexUSB
                             Bpm = bpm > 0 ? bpm : _currentState.Bpm,
                             Timestamp = DateTime.UtcNow
                         };
-                        if (bpm > 0) Console.WriteLine($"[ProtocolService] ✅ BPM from preset: {bpm}");
+                        if (bpm > 0) _logger.LogDebug("[ProtocolService] BPM from preset: {Bpm}", bpm);
                     }
                 }
 
-                Console.WriteLine($"[ProtocolService] 🔥 FRESH COMPLETE STATE: Preset='{_currentState.PresetDetails?.Name}', Scene={_currentState.Scene}, Mode={DeviceMode.GetModeName(_currentState.Mode)}, BPM={_currentState.Bpm}");
+                _logger.LogDebug("[ProtocolService] Fresh complete state: Preset={PresetName}, Scene={Scene}, Mode={Mode}, BPM={Bpm}",
+                    _currentState.PresetDetails?.Name, _currentState.Scene, DeviceMode.GetModeName(_currentState.Mode), _currentState.Bpm);
 
                 if (anyUpdated)
                 {
@@ -177,7 +182,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Failed to refresh state: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Failed to refresh state");
                 return false;
             }
             finally
@@ -191,7 +196,7 @@ namespace OpenCortex.CortexUSB
 
         private bool QueryAndUpdatePresetPosition()
         {
-            Console.WriteLine("[ProtocolService] Querying current preset position...");
+            _logger.LogDebug("[ProtocolService] Querying current preset position...");
             byte[] query = ProtobufBuilder.BuildStateQuery();
             if (!SendCommand(query, MessageTypes.SetlistPosition)) return false;
 
@@ -208,14 +213,14 @@ namespace OpenCortex.CortexUSB
                     return false;
 
                 _currentState = _currentState with { CurrentPreset = presetInfo, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] ✅ Preset Position: {presetInfo.SetlistPath}[{presetInfo.PresetIndex}]");
+                _logger.LogDebug("[ProtocolService] Preset position: {SetlistPath}[{PresetIndex}]", presetInfo.SetlistPath, presetInfo.PresetIndex);
                 return true;
             }
         }
 
         private bool QueryAndUpdateRecallPreset()
         {
-            Console.WriteLine("[ProtocolService] Querying preset details...");
+            _logger.LogDebug("[ProtocolService] Querying preset details...");
             byte[] query = ProtobufBuilder.BuildStateQuery();
             if (!SendCommand(query, MessageTypes.RecallPreset)) return false;
 
@@ -243,7 +248,7 @@ namespace OpenCortex.CortexUSB
                     Bpm = bpm > 0 ? bpm : _currentState.Bpm,
                     Timestamp = DateTime.UtcNow
                 };
-                Console.WriteLine($"[ProtocolService] ✅ Preset Details: '{details?.Name}' by {details?.Author}, BPM={bpm}");
+                _logger.LogDebug("[ProtocolService] Preset details: '{Name}' by {Author}, BPM={Bpm}", details?.Name, details?.Author, bpm);
                 return true;
             }
         }
@@ -255,7 +260,7 @@ namespace OpenCortex.CortexUSB
             Func<DeviceState, T, DateTime, DeviceState> updateState,
             Action<T>? onUpdated = null) where T : struct
         {
-            Console.WriteLine($"[ProtocolService] Querying {fieldName}...");
+            _logger.LogDebug("[ProtocolService] Querying {FieldName}...", fieldName);
             byte[] query = ProtobufBuilder.BuildStateQuery();
             if (!SendCommand(query, messageType)) return false;
 
@@ -373,8 +378,9 @@ namespace OpenCortex.CortexUSB
             }
         }
 
-        public ProtocolService(ProtocolClient? client = null)
+        public ProtocolService(ProtocolClient? client = null, ILogger<ProtocolService>? logger = null)
         {
+            _logger = logger ?? new SimpleConsoleLogger<ProtocolService>();
             _client = client ?? new ProtocolClient(new UsbHidTransport());
             _incomingMessages = new ConcurrentQueue<WirePayload>();
             _cts = new CancellationTokenSource();
@@ -408,7 +414,7 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected) return; // already known-disconnected; avoid duplicate events
             _isConnected = false;
-            Console.WriteLine($"[ProtocolService] ⚠️ Device connection lost: {reason}");
+            _logger.LogWarning("[ProtocolService] Device connection lost: {Reason}", reason);
             OnConnectionStatusChanged?.Invoke(false, reason);
         }
 
@@ -430,12 +436,12 @@ namespace OpenCortex.CortexUSB
             {
                 if (_isConnected) return; // re-check now that we hold the lock
 
-                Console.WriteLine("[ProtocolService] 🔄 Attempting to reconnect to device...");
+                _logger.LogInformation("[ProtocolService] Attempting to reconnect to device...");
                 bool reconnected = await Task.Run(() => _client.Connect(TimeSpan.FromSeconds(3)));
                 if (!reconnected) return;
 
                 _isConnected = true;
-                Console.WriteLine("[ProtocolService] ✅ Reconnected — refreshing state...");
+                _logger.LogInformation("[ProtocolService] Reconnected — refreshing state...");
 
                 _suppressStateEvents = true;
                 await QueryInitialStateAsync();
@@ -446,7 +452,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Reconnect attempt failed: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Reconnect attempt failed");
             }
             finally
             {
@@ -467,7 +473,7 @@ namespace OpenCortex.CortexUSB
                     return true;
 
                 TimeSpan actualTimeout = timeout ?? TimeSpan.FromSeconds(10);
-                Console.WriteLine($"[ProtocolService] Connecting with timeout {actualTimeout.TotalSeconds}s...");
+                _logger.LogInformation("[ProtocolService] Connecting with timeout {TimeoutSeconds}s...", actualTimeout.TotalSeconds);
 
                 // Suppress state events during initialization to avoid spam
                 _suppressStateEvents = true;
@@ -477,25 +483,25 @@ namespace OpenCortex.CortexUSB
 
                 if (!connected)
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Connection failed");
+                    _logger.LogWarning("[ProtocolService] Connection failed");
                     _suppressStateEvents = false;
                     return false;
                 }
 
                 _isConnected = true;
                 _everConnected = true;
-                Console.WriteLine("[ProtocolService] ✅ Connected");
+                _logger.LogInformation("[ProtocolService] Connected");
 
                 // Query initial state
                 await QueryInitialStateAsync();
 
                 // Re-enable state events and fire a single complete event
                 _suppressStateEvents = false;
-                Console.WriteLine("[ProtocolService] 🔧 State event suppression disabled, ready for hardware changes");
+                _logger.LogDebug("[ProtocolService] State event suppression disabled, ready for hardware changes");
 
-                // Disable background polling - use on-demand refresh instead 
+                // Disable background polling - use on-demand refresh instead
                 // _statePollingTimer?.Change(TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
-                Console.WriteLine("[ProtocolService] ✅ Using on-demand state refresh instead of background polling");
+                _logger.LogDebug("[ProtocolService] Using on-demand state refresh instead of background polling");
 
                 // Notify state change - single event after full initialization
                 FireStateChanged(StateUpdate.FromDevice(_currentState));
@@ -517,7 +523,7 @@ namespace OpenCortex.CortexUSB
         /// </summary>
         private async Task QueryInitialStateAsync()
         {
-            Console.WriteLine("[ProtocolService] Querying initial state...");
+            _logger.LogDebug("[ProtocolService] Querying initial state...");
 
             // Query Setlist Position (type 2) — which preset slot is loaded
             await QueryStateFieldAsync(MessageTypes.SetlistPosition, "SetlistPosition", TimeSpan.FromSeconds(5));
@@ -537,7 +543,8 @@ namespace OpenCortex.CortexUSB
             // Request preset library listing (type 4)
             await RequestPresetLibraryAsync(TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(1), true);
 
-            Console.WriteLine($"[ProtocolService] Initial state: Scene={_currentState.Scene}, Mode={DeviceMode.GetModeName(_currentState.Mode)}, BPM={_currentState.Bpm}");
+            _logger.LogDebug("[ProtocolService] Initial state: Scene={Scene}, Mode={Mode}, BPM={Bpm}",
+                _currentState.Scene, DeviceMode.GetModeName(_currentState.Mode), _currentState.Bpm);
         }
 
         private async Task QueryStateFieldAsync(uint messageType, string fieldName, TimeSpan? responseTimeout = null)
@@ -554,18 +561,18 @@ namespace OpenCortex.CortexUSB
                         if (response != null)
                         {
                             _incomingMessages.Enqueue(response);
-                            Console.WriteLine($"[ProtocolService] Queried {fieldName}: received {response.Payload.Length} bytes");
+                            _logger.LogDebug("[ProtocolService] Queried {FieldName}: received {ByteCount} bytes", fieldName, response.Payload.Length);
                         }
                         else
                         {
-                            Console.WriteLine($"[ProtocolService] ⚠️ No response for {fieldName} query");
+                            _logger.LogWarning("[ProtocolService] No response for {FieldName} query", fieldName);
                         }
                     }, _cts.Token);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] ⚠️ Error querying {fieldName}: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error querying {FieldName}", fieldName);
             }
         }
 
@@ -579,14 +586,14 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot change preset - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot change preset - not connected");
                 return false;
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Changing to preset {presetIndex} in '{setlistPath}' (factory={isFactory})...");
+                _logger.LogInformation("[ProtocolService] Changing to preset {PresetIndex} in '{SetlistPath}' (factory={IsFactory})...", presetIndex, setlistPath, isFactory);
 
                 // Suppress intermediate state events — the device pushes responses
                 // during the delay and queries below, each of which would fire a
@@ -596,11 +603,11 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildSetlistPositionMessage(setlistPath, presetIndex, isFactory);
                 if (!SendCommand(message, MessageTypes.SetlistPosition))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send preset change message");
+                    _logger.LogWarning("[ProtocolService] Failed to send preset change message");
                     return false;
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Preset change command sent");
+                _logger.LogDebug("[ProtocolService] Preset change command sent");
 
                 // Wait a bit for the device to switch presets
                 await Task.Delay(500);
@@ -617,7 +624,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error changing preset: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error changing preset");
                 return false;
             }
             finally
@@ -630,13 +637,13 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot set scene - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot set scene - not connected");
                 return false;
             }
 
             if (sceneIndex < 0 || sceneIndex > 7)
             {
-                Console.WriteLine($"[ProtocolService] ⚠️ Invalid scene {sceneIndex} (must be 0-7)");
+                _logger.LogWarning("[ProtocolService] Invalid scene {SceneIndex} (must be 0-7)", sceneIndex);
                 return false;
             }
 
@@ -648,16 +655,16 @@ namespace OpenCortex.CortexUSB
                 lock (_stateLock) { currentScene = _currentState.Scene; }
                 if (currentScene == sceneIndex)
                 {
-                    Console.WriteLine($"[ProtocolService] Scene already {sceneIndex}, skipping write");
+                    _logger.LogDebug("[ProtocolService] Scene already {SceneIndex}, skipping write", sceneIndex);
                     return true;
                 }
 
-                Console.WriteLine($"[ProtocolService] Setting scene to {sceneIndex}...");
+                _logger.LogDebug("[ProtocolService] Setting scene to {SceneIndex}...", sceneIndex);
 
                 byte[] message = ProtobufBuilder.BuildSceneMessage(sceneIndex);
                 if (!SendCommand(message, MessageTypes.Scene))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send scene message");
+                    _logger.LogWarning("[ProtocolService] Failed to send scene message");
                     return false;
                 }
 
@@ -669,7 +676,7 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Scene {sceneIndex} sent but no device echo within 2s");
+                    _logger.LogWarning("[ProtocolService] Scene {SceneIndex} sent but no device echo within 2s", sceneIndex);
                     return false;
                 }
 
@@ -679,7 +686,7 @@ namespace OpenCortex.CortexUSB
                     _currentState = _currentState with { Scene = sceneIndex, Timestamp = DateTime.UtcNow };
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Scene set to {sceneIndex} (device echo confirmed)");
+                _logger.LogInformation("[ProtocolService] Scene set to {SceneIndex} (device echo confirmed)", sceneIndex);
 
                 // Fire state change event
                 FireStateChanged(StateUpdate.FromClient(_currentState, "scene"));
@@ -699,19 +706,19 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot set mode - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot set mode - not connected");
                 return false;
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting mode to {DeviceMode.GetModeName(mode)}...");
+                _logger.LogDebug("[ProtocolService] Setting mode to {Mode}...", DeviceMode.GetModeName(mode));
 
                 byte[] message = ProtobufBuilder.BuildModeMessage(mode);
                 if (!SendCommand(message, MessageTypes.Mode))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send mode message");
+                    _logger.LogWarning("[ProtocolService] Failed to send mode message");
                     return false;
                 }
 
@@ -723,7 +730,7 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Mode {DeviceMode.GetModeName(mode)} sent but no device echo within 2s");
+                    _logger.LogWarning("[ProtocolService] Mode {Mode} sent but no device echo within 2s", DeviceMode.GetModeName(mode));
                     return false;
                 }
 
@@ -733,7 +740,7 @@ namespace OpenCortex.CortexUSB
                     _currentState = _currentState with { Mode = mode, Timestamp = DateTime.UtcNow };
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Mode set to {DeviceMode.GetModeName(mode)} (device echo confirmed)");
+                _logger.LogInformation("[ProtocolService] Mode set to {Mode} (device echo confirmed)", DeviceMode.GetModeName(mode));
 
                 // Fire state change event
                 FireStateChanged(StateUpdate.FromClient(_currentState, "mode"));
@@ -753,14 +760,14 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot set tempo - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot set tempo - not connected");
                 return false;
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting BPM to {bpm}...");
+                _logger.LogDebug("[ProtocolService] Setting BPM to {Bpm}...", bpm);
 
                 // Per-preset tempo is a Grid UPDATE on tempoProgramData (model 25000),
                 // not a GlobalTempo message. Sending type 33 was the old bug: it
@@ -768,7 +775,7 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildTempoGridMessage(bpm);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send tempo message");
+                    _logger.LogWarning("[ProtocolService] Failed to send tempo message");
                     return false;
                 }
 
@@ -792,11 +799,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echoed)
                 {
-                    Console.WriteLine($"[ProtocolService] ✅ BPM set to {bpm} (device echo confirmed)");
+                    _logger.LogInformation("[ProtocolService] BPM set to {Bpm} (device echo confirmed)", bpm);
                 }
                 else
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ BPM {bpm} sent but no device echo within 2s — tempo MODE may be GLOBAL, so the preset value may be stored but not audible until PRESET mode");
+                    _logger.LogWarning("[ProtocolService] BPM {Bpm} sent but no device echo within 2s — tempo MODE may be GLOBAL, so the preset value may be stored but not audible until PRESET mode", bpm);
                 }
 
                 // Fire state change event
@@ -818,20 +825,20 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot set block bypass - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot set block bypass - not connected");
                 return false;
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting block bypass: row={rowIndex}, col={columnIndex}, bypassed={bypassed}");
+                _logger.LogDebug("[ProtocolService] Setting block bypass: row={Row}, col={Col}, bypassed={Bypassed}", rowIndex, columnIndex, bypassed);
 
                 // Use simplified bypass message (no scene parameter needed)
                 byte[] message = ProtobufBuilder.BuildGridBypassMessage(rowIndex, columnIndex, bypassed);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send grid bypass message");
+                    _logger.LogWarning("[ProtocolService] Failed to send grid bypass message");
                     return false;
                 }
 
@@ -842,14 +849,15 @@ namespace OpenCortex.CortexUSB
                 if (!WaitForGridEcho(p => GridEchoConfirmsBypass(p, rowIndex, columnIndex, bypassed),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but bypass [{rowIndex},{columnIndex}]={bypassed} not matched — write may not have taken"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for bypass [{rowIndex},{columnIndex}] — write likely refused (e.g. invalid position)");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but bypass [{Row},{Col}]={Bypassed} not matched — write may not have taken", rowIndex, columnIndex, bypassed);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for bypass [{Row},{Col}] — write likely refused (e.g. invalid position)", rowIndex, columnIndex);
                     return false;
                 }
                 if (preciseMatch)
                 {
-                    Console.WriteLine($"[ProtocolService] ✅ Bypass [{rowIndex},{columnIndex}]={bypassed} confirmed by device echo");
+                    _logger.LogDebug("[ProtocolService] Bypass [{Row},{Col}]={Bypassed} confirmed by device echo", rowIndex, columnIndex, bypassed);
                 }
 
                 // Update state optimistically - update the grid
@@ -863,7 +871,7 @@ namespace OpenCortex.CortexUSB
                             // Match by position in array, not SlotIndex
                             if (index == columnIndex)
                             {
-                                Console.WriteLine($"[ProtocolService] Block [{rowIndex},{columnIndex}] '{block.Name}' bypass: {block.Bypassed} -> {bypassed}");
+                                _logger.LogDebug("[ProtocolService] Block [{Row},{Col}] '{Name}' bypass: {OldBypassed} -> {NewBypassed}", rowIndex, columnIndex, block.Name, block.Bypassed, bypassed);
                                 return block with { Bypassed = bypassed };
                             }
                             return block;
@@ -874,11 +882,11 @@ namespace OpenCortex.CortexUSB
                     }
                     else
                     {
-                        Console.WriteLine($"[ProtocolService] ⚠️ Invalid grid position: row={rowIndex}, col={columnIndex}");
+                        _logger.LogWarning("[ProtocolService] Invalid grid position: row={Row}, col={Col}", rowIndex, columnIndex);
                     }
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Block bypass set");
+                _logger.LogDebug("[ProtocolService] Block bypass set");
 
                 // Fire state change event
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
@@ -898,19 +906,19 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[ProtocolService] Cannot set block parameter - not connected");
+                _logger.LogWarning("[ProtocolService] Cannot set block parameter - not connected");
                 return false;
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting block parameter: row={rowIndex}, col={columnIndex}, param={paramIndex}, value={value}");
+                _logger.LogDebug("[ProtocolService] Setting block parameter: row={Row}, col={Col}, param={Param}, value={Value}", rowIndex, columnIndex, paramIndex, value);
 
                 byte[] message = ProtobufBuilder.BuildGridParamMessage(rowIndex, columnIndex, paramIndex, value);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send grid parameter message");
+                    _logger.LogWarning("[ProtocolService] Failed to send grid parameter message");
                     return false;
                 }
 
@@ -920,14 +928,15 @@ namespace OpenCortex.CortexUSB
                 if (!WaitForGridEcho(p => GridEchoConfirmsParam(p, rowIndex, columnIndex, paramIndex, value),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but param [{rowIndex},{columnIndex}]{paramIndex}={value} not matched — write may not have taken"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for param [{rowIndex},{columnIndex}]{paramIndex} — write likely refused");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but param [{Row},{Col}]{Param}={Value} not matched — write may not have taken", rowIndex, columnIndex, paramIndex, value);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for param [{Row},{Col}]{Param} — write likely refused", rowIndex, columnIndex, paramIndex);
                     return false;
                 }
                 if (preciseMatch)
                 {
-                    Console.WriteLine($"[ProtocolService] ✅ Param [{rowIndex},{columnIndex}]{paramIndex}={value} confirmed by device echo");
+                    _logger.LogDebug("[ProtocolService] Param [{Row},{Col}]{Param}={Value} confirmed by device echo", rowIndex, columnIndex, paramIndex, value);
                 }
 
                 // Update state optimistically - update the parameter value in the grid
@@ -953,7 +962,7 @@ namespace OpenCortex.CortexUSB
                     }
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Block parameter set");
+                _logger.LogDebug("[ProtocolService] Block parameter set");
 
                 // Fire state change event
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
@@ -973,29 +982,30 @@ namespace OpenCortex.CortexUSB
         public async Task<bool> SetBlockAsync(int rowIndex, int columnIndex, uint modelHash)
         {
             if (!_isConnected) return LogNotConnected("set block");
-            if (modelHash == 0) { Console.WriteLine($"[ProtocolService] ⚠️ Model hash 0 is not a valid block"); return false; }
+            if (modelHash == 0) { _logger.LogWarning("[ProtocolService] Model hash 0 is not a valid block"); return false; }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting block: row={rowIndex}, col={columnIndex}, hash={modelHash}");
+                _logger.LogDebug("[ProtocolService] Setting block: row={Row}, col={Col}, hash={Hash}", rowIndex, columnIndex, modelHash);
 
                 byte[] message = ProtobufBuilder.BuildGridSetBlockMessage(rowIndex, columnIndex, modelHash);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send grid set-block message");
+                    _logger.LogWarning("[ProtocolService] Failed to send grid set-block message");
                     return false;
                 }
 
                 if (!WaitForGridEcho(p => GridEchoConfirmsBlock(p, rowIndex, columnIndex, modelHash),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but block [{rowIndex},{columnIndex}] not confirmed — likely DSP capacity refusal"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for block [{rowIndex},{columnIndex}] — likely DSP capacity refusal");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but block [{Row},{Col}] not confirmed — likely DSP capacity refusal", rowIndex, columnIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for block [{Row},{Col}] — likely DSP capacity refusal", rowIndex, columnIndex);
                     return false;
                 }
-                if (preciseMatch) Console.WriteLine($"[ProtocolService] ✅ Block [{rowIndex},{columnIndex}] hash={modelHash} confirmed by device echo");
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Block [{Row},{Col}] hash={Hash} confirmed by device echo", rowIndex, columnIndex, modelHash);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
                 return true;
@@ -1016,24 +1026,25 @@ namespace OpenCortex.CortexUSB
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Removing block: row={rowIndex}, col={columnIndex}");
+                _logger.LogDebug("[ProtocolService] Removing block: row={Row}, col={Col}", rowIndex, columnIndex);
 
                 byte[] message = ProtobufBuilder.BuildGridRemoveBlockMessage(rowIndex, columnIndex);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send grid remove-block message");
+                    _logger.LogWarning("[ProtocolService] Failed to send grid remove-block message");
                     return false;
                 }
 
                 if (!WaitForGridEcho(p => GridEchoConfirmsRemoved(p, rowIndex, columnIndex),
                                      out bool gridSeen, out _))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but removal [{rowIndex},{columnIndex}] not confirmed"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for removal [{rowIndex},{columnIndex}]");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but removal [{Row},{Col}] not confirmed", rowIndex, columnIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for removal [{Row},{Col}]", rowIndex, columnIndex);
                     return false;
                 }
-                Console.WriteLine($"[ProtocolService] ✅ Block [{rowIndex},{columnIndex}] removal confirmed by device echo");
+                _logger.LogDebug("[ProtocolService] Block [{Row},{Col}] removal confirmed by device echo", rowIndex, columnIndex);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
                 return true;
@@ -1054,24 +1065,25 @@ namespace OpenCortex.CortexUSB
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting chain input: row={rowIndex}, port={inPortId}");
+                _logger.LogDebug("[ProtocolService] Setting chain input: row={Row}, port={Port}", rowIndex, inPortId);
 
                 byte[] message = ProtobufBuilder.BuildGridChainInputMessage(rowIndex, inPortId);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send chain-input message");
+                    _logger.LogWarning("[ProtocolService] Failed to send chain-input message");
                     return false;
                 }
 
                 if (!WaitForGridEcho(p => GridEchoConfirmsChainField(p, rowIndex, c => c.HasInPortid && c.InPortid == inPortId),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but input row={rowIndex} not confirmed"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for chain input row={rowIndex}");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but input row={Row} not confirmed", rowIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for chain input row={Row}", rowIndex);
                     return false;
                 }
-                if (preciseMatch) Console.WriteLine($"[ProtocolService] ✅ Chain input row={rowIndex} → {inPortId} confirmed by device echo");
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Chain input row={Row} -> {Port} confirmed by device echo", rowIndex, inPortId);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
                 return true;
@@ -1092,24 +1104,25 @@ namespace OpenCortex.CortexUSB
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting chain output: row={rowIndex}, port={outPortId}");
+                _logger.LogDebug("[ProtocolService] Setting chain output: row={Row}, port={Port}", rowIndex, outPortId);
 
                 byte[] message = ProtobufBuilder.BuildGridChainOutputMessage(rowIndex, outPortId);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send chain-output message");
+                    _logger.LogWarning("[ProtocolService] Failed to send chain-output message");
                     return false;
                 }
 
                 if (!WaitForGridEcho(p => GridEchoConfirmsChainField(p, rowIndex, c => c.HasOutPortid && c.OutPortid == outPortId),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but output row={rowIndex} not confirmed"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for chain output row={rowIndex}");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but output row={Row} not confirmed", rowIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for chain output row={Row}", rowIndex);
                     return false;
                 }
-                if (preciseMatch) Console.WriteLine($"[ProtocolService] ✅ Chain output row={rowIndex} → {outPortId} confirmed by device echo");
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Chain output row={Row} -> {Port} confirmed by device echo", rowIndex, outPortId);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
                 return true;
@@ -1131,12 +1144,12 @@ namespace OpenCortex.CortexUSB
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Setting split: row={rowIndex}, split={splitColumn}, mix={mixColumn}");
+                _logger.LogDebug("[ProtocolService] Setting split: row={Row}, split={Split}, mix={Mix}", rowIndex, splitColumn, mixColumn);
 
                 byte[] message = ProtobufBuilder.BuildGridSplitMessage(rowIndex, splitColumn, mixColumn);
                 if (!SendCommand(message, MessageTypes.Grid))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send split message");
+                    _logger.LogWarning("[ProtocolService] Failed to send split message");
                     return false;
                 }
 
@@ -1144,12 +1157,13 @@ namespace OpenCortex.CortexUSB
                                      c => c.SplitControlPoints.Any(s => s.Split == splitColumn && s.Mix == mixColumn)),
                                      out bool gridSeen, out bool preciseMatch))
                 {
-                    Console.WriteLine(gridSeen
-                        ? $"[ProtocolService] ⚠️ Grid echo seen but split row={rowIndex} not confirmed"
-                        : $"[ProtocolService] ❌ No Grid echo within 2s for split row={rowIndex}");
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but split row={Row} not confirmed", rowIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for split row={Row}", rowIndex);
                     return false;
                 }
-                if (preciseMatch) Console.WriteLine($"[ProtocolService] ✅ Split row={rowIndex} confirmed by device echo");
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Split row={Row} confirmed by device echo", rowIndex);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
                 return true;
@@ -1172,7 +1186,7 @@ namespace OpenCortex.CortexUSB
             if (!_isConnected) return LogNotConnected("save preset");
             if (string.IsNullOrWhiteSpace(setlistPath) || string.IsNullOrWhiteSpace(slot) || string.IsNullOrWhiteSpace(name))
             {
-                Console.WriteLine("[ProtocolService] ⚠️ setlistPath, slot and name are required to save");
+                _logger.LogWarning("[ProtocolService] setlistPath, slot and name are required to save");
                 return false;
             }
 
@@ -1181,12 +1195,12 @@ namespace OpenCortex.CortexUSB
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
             {
-                Console.WriteLine($"[ProtocolService] Saving preset '{name}' to {setlistPath} slot {slotIndex} (instrument={instrument})...");
+                _logger.LogInformation("[ProtocolService] Saving preset '{Name}' to {SetlistPath} slot {SlotIndex} (instrument={Instrument})...", name, setlistPath, slotIndex, instrument);
 
                 byte[] message = ProtobufBuilder.BuildSavePresetMessage(setlistPath, slotIndex, name, instrument);
                 if (!SendCommand(message, MessageTypes.File))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send save-preset message");
+                    _logger.LogWarning("[ProtocolService] Failed to send save-preset message");
                     return false;
                 }
 
@@ -1199,11 +1213,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Save sent but no listing echo for slot {slotIndex} within 5s — check the setlist on the unit");
+                    _logger.LogWarning("[ProtocolService] Save sent but no listing echo for slot {SlotIndex} within 5s — check the setlist on the unit", slotIndex);
                 }
                 else
                 {
-                    Console.WriteLine($"[ProtocolService] ✅ Save confirmed by device listing (slot {slotIndex})");
+                    _logger.LogInformation("[ProtocolService] Save confirmed by device listing (slot {SlotIndex})", slotIndex);
                 }
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "preset"));
@@ -1211,7 +1225,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error saving preset: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error saving preset");
                 return false;
             }
             finally
@@ -1252,20 +1266,20 @@ namespace OpenCortex.CortexUSB
             if (!_isConnected) return LogNotConnected("set global EQ band");
             if (band < 1 || band > ProtobufBuilder.GlobalEqBands)
             {
-                Console.WriteLine($"[ProtocolService] ⚠️ Invalid EQ band {band} (must be 1-{ProtobufBuilder.GlobalEqBands})");
+                _logger.LogWarning("[ProtocolService] Invalid EQ band {Band} (must be 1-{MaxBand})", band, ProtobufBuilder.GlobalEqBands);
                 return false;
             }
 
-            List<(int Offset, float Value)> writes = [];
-            if (gain.HasValue) writes.Add((0, gain.Value));
-            if (frequency.HasValue) writes.Add((1, frequency.Value));
-            if (q.HasValue) writes.Add((2, q.Value));
-            if (filterType.HasValue) writes.Add((3, filterType.Value));
-            if (enabled.HasValue) writes.Add((4, enabled.Value ? 1f : 0f));
+            List<ParamWrite> writes = [];
+            if (gain.HasValue) writes.Add(new ParamWrite(0, gain.Value));
+            if (frequency.HasValue) writes.Add(new ParamWrite(1, frequency.Value));
+            if (q.HasValue) writes.Add(new ParamWrite(2, q.Value));
+            if (filterType.HasValue) writes.Add(new ParamWrite(3, filterType.Value));
+            if (enabled.HasValue) writes.Add(new ParamWrite(4, enabled.Value ? 1f : 0f));
 
             if (writes.Count == 0)
             {
-                Console.WriteLine("[ProtocolService] ⚠️ SetGlobalEqBandAsync needs at least one control (gain/frequency/q/filterType/enabled)");
+                _logger.LogWarning("[ProtocolService] SetGlobalEqBandAsync needs at least one control (gain/frequency/q/filterType/enabled)");
                 return false;
             }
 
@@ -1273,13 +1287,14 @@ namespace OpenCortex.CortexUSB
             try
             {
                 bool anyConfirmed = false;
-                foreach ((int offset, float value) in writes)
+                foreach (ParamWrite write in writes)
                 {
-                    int paramIndex = ProtobufBuilder.GlobalEqBandParamIndex(band, offset);
+                    int paramIndex = ProtobufBuilder.GlobalEqBandParamIndex(band, write.Offset);
+                    float value = write.Value;
                     byte[] message = ProtobufBuilder.BuildGlobalEqParamMessage(paramIndex, value);
                     if (!SendCommand(message, MessageTypes.GlobalEQ))
                     {
-                        Console.WriteLine($"[ProtocolService] ❌ Failed to send GlobalEQ band {band} param {paramIndex}");
+                        _logger.LogWarning("[ProtocolService] Failed to send GlobalEQ band {Band} param {Param}", band, paramIndex);
                         continue;
                     }
 
@@ -1289,14 +1304,15 @@ namespace OpenCortex.CortexUSB
                         TimeSpan.FromSeconds(2));
 
                     if (echo == null)
-                        Console.WriteLine($"[ProtocolService] ⚠️ GlobalEQ band {band} param {paramIndex}={value} sent but no device echo within 2s");
+                        _logger.LogWarning("[ProtocolService] GlobalEQ band {Band} param {Param}={Value} sent but no device echo within 2s", band, paramIndex, value);
                     else
                         anyConfirmed = true;
                 }
 
-                Console.WriteLine(anyConfirmed
-                    ? $"[ProtocolService] ✅ GlobalEQ band {band} updated"
-                    : $"[ProtocolService] ❌ GlobalEQ band {band} — no writes confirmed");
+                if (anyConfirmed)
+                    _logger.LogDebug("[ProtocolService] GlobalEQ band {Band} updated", band);
+                else
+                    _logger.LogWarning("[ProtocolService] GlobalEQ band {Band} — no writes confirmed", band);
 
                 FireStateChanged(StateUpdate.FromClient(_currentState, "globalEq"));
                 return anyConfirmed;
@@ -1315,14 +1331,14 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected) return LogNotConnected("set global EQ output");
 
-            List<(int Index, float Value)> writes = [];
-            if (level.HasValue) writes.Add((ProtobufBuilder.GlobalEqOutLevelIndex, level.Value));
-            if (out12.HasValue) writes.Add((ProtobufBuilder.GlobalEqOut12Index, out12.Value ? 1f : 0f));
-            if (out34.HasValue) writes.Add((ProtobufBuilder.GlobalEqOut34Index, out34.Value ? 1f : 0f));
+            List<ParamWrite> writes = [];
+            if (level.HasValue) writes.Add(new ParamWrite(ProtobufBuilder.GlobalEqOutLevelIndex, level.Value));
+            if (out12.HasValue) writes.Add(new ParamWrite(ProtobufBuilder.GlobalEqOut12Index, out12.Value ? 1f : 0f));
+            if (out34.HasValue) writes.Add(new ParamWrite(ProtobufBuilder.GlobalEqOut34Index, out34.Value ? 1f : 0f));
 
             if (writes.Count == 0)
             {
-                Console.WriteLine("[ProtocolService] ⚠️ SetGlobalEqOutputAsync needs level, out12 or out34");
+                _logger.LogWarning("[ProtocolService] SetGlobalEqOutputAsync needs level, out12 or out34");
                 return false;
             }
 
@@ -1330,8 +1346,10 @@ namespace OpenCortex.CortexUSB
             try
             {
                 bool anyConfirmed = false;
-                foreach ((int index, float value) in writes)
+                foreach (ParamWrite write in writes)
                 {
+                    int index = write.Offset;
+                    float value = write.Value;
                     byte[] message = ProtobufBuilder.BuildGlobalEqParamMessage(index, value);
                     if (!SendCommand(message, MessageTypes.GlobalEQ)) continue;
 
@@ -1342,9 +1360,10 @@ namespace OpenCortex.CortexUSB
                     if (echo != null) anyConfirmed = true;
                 }
 
-                Console.WriteLine(anyConfirmed
-                    ? "[ProtocolService] ✅ GlobalEQ output updated"
-                    : "[ProtocolService] ❌ GlobalEQ output — no writes confirmed");
+                if (anyConfirmed)
+                    _logger.LogDebug("[ProtocolService] GlobalEQ output updated");
+                else
+                    _logger.LogWarning("[ProtocolService] GlobalEQ output — no writes confirmed");
                 FireStateChanged(StateUpdate.FromClient(_currentState, "globalEq"));
                 return anyConfirmed;
             }
@@ -1365,7 +1384,7 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildGlobalEqBypassMessage(bypassed);
                 if (!SendCommand(message, MessageTypes.GlobalEQ))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send GlobalEQ bypass message");
+                    _logger.LogWarning("[ProtocolService] Failed to send GlobalEQ bypass message");
                     return false;
                 }
 
@@ -1376,11 +1395,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ GlobalEQ bypass={bypassed} sent but no device echo within 2s");
+                    _logger.LogWarning("[ProtocolService] GlobalEQ bypass={Bypassed} sent but no device echo within 2s", bypassed);
                     return false;
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ GlobalEQ bypass set to {bypassed}");
+                _logger.LogDebug("[ProtocolService] GlobalEQ bypass set to {Bypassed}", bypassed);
                 FireStateChanged(StateUpdate.FromClient(_currentState, "globalEq"));
                 return true;
             }
@@ -1401,7 +1420,7 @@ namespace OpenCortex.CortexUSB
             if (!_isConnected) return LogNotConnected("set master volume");
             if (volume < 0f || volume > 1f)
             {
-                Console.WriteLine($"[ProtocolService] ⚠️ Master volume must be 0..1, got {volume}");
+                _logger.LogWarning("[ProtocolService] Master volume must be 0..1, got {Volume}", volume);
                 return false;
             }
 
@@ -1411,7 +1430,7 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildMasterVolumeMessage(volume);
                 if (!SendCommand(message, MessageTypes.MasterVolume))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send master volume message");
+                    _logger.LogWarning("[ProtocolService] Failed to send master volume message");
                     return false;
                 }
 
@@ -1433,11 +1452,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Master volume {volume:0.###} sent but no device echo within 3s");
+                    _logger.LogWarning("[ProtocolService] Master volume {Volume:0.###} sent but no device echo within 3s", volume);
                     return false;
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Master volume set to {volume:0.###} (device echo confirmed)");
+                _logger.LogDebug("[ProtocolService] Master volume set to {Volume:0.###} (device echo confirmed)", volume);
                 FireStateChanged(StateUpdate.FromClient(_currentState, "masterVolume"));
                 return true;
             }
@@ -1461,7 +1480,7 @@ namespace OpenCortex.CortexUSB
         {
             if (!_isConnected) return LogNotConnected("set tuner input");
 
-            Console.WriteLine("[ProtocolService] ⚠️ Writing to the Tuner invisibly ENGAGES it — nothing changes on screen. If mute is already on, this silences the outputs with no visible cause; call RestoreAudioAsync() when done.");
+            _logger.LogWarning("[ProtocolService] Writing to the Tuner invisibly ENGAGES it — nothing changes on screen. If mute is already on, this silences the outputs with no visible cause; call RestoreAudioAsync() when done.");
 
             await _operationSemaphore.WaitAsync(_cts.Token);
             try
@@ -1469,7 +1488,7 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildTunerInputMessage(inputPortId);
                 if (!SendCommand(message, MessageTypes.Tuner))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send tuner input message");
+                    _logger.LogWarning("[ProtocolService] Failed to send tuner input message");
                     return false;
                 }
 
@@ -1488,11 +1507,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Tuner input {inputPortId} sent but no device echo within 2s (some inputs are silently refused)");
+                    _logger.LogWarning("[ProtocolService] Tuner input {InputPortId} sent but no device echo within 2s (some inputs are silently refused)", inputPortId);
                     return false;
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Tuner input set to {inputPortId} (device echo confirmed)");
+                _logger.LogDebug("[ProtocolService] Tuner input set to {InputPortId} (device echo confirmed)", inputPortId);
                 FireStateChanged(StateUpdate.FromClient(_currentState, "tuner"));
                 return true;
             }
@@ -1519,7 +1538,7 @@ namespace OpenCortex.CortexUSB
 
             if (mute)
             {
-                Console.WriteLine("[ProtocolService] ⚠️ Engaging tuner mute SILENCES the outputs with nothing on screen to explain it. Call RestoreAudioAsync() to undo, or have someone close the tuner on the unit.");
+                _logger.LogWarning("[ProtocolService] Engaging tuner mute SILENCES the outputs with nothing on screen to explain it. Call RestoreAudioAsync() to undo, or have someone close the tuner on the unit.");
             }
 
             await _operationSemaphore.WaitAsync(_cts.Token);
@@ -1528,7 +1547,7 @@ namespace OpenCortex.CortexUSB
                 byte[] message = ProtobufBuilder.BuildTunerMuteMessage(mute);
                 if (!SendCommand(message, MessageTypes.Tuner))
                 {
-                    Console.WriteLine("[ProtocolService] ❌ Failed to send tuner mute message");
+                    _logger.LogWarning("[ProtocolService] Failed to send tuner mute message");
                     return false;
                 }
 
@@ -1547,11 +1566,11 @@ namespace OpenCortex.CortexUSB
 
                 if (echo == null)
                 {
-                    Console.WriteLine($"[ProtocolService] ⚠️ Tuner mute={mute} sent but no device echo within 2s");
+                    _logger.LogWarning("[ProtocolService] Tuner mute={Mute} sent but no device echo within 2s", mute);
                     return false;
                 }
 
-                Console.WriteLine($"[ProtocolService] ✅ Tuner mute set to {mute} (device echo confirmed)");
+                _logger.LogDebug("[ProtocolService] Tuner mute set to {Mute} (device echo confirmed)", mute);
                 FireStateChanged(StateUpdate.FromClient(_currentState, "tuner"));
                 return true;
             }
@@ -1576,11 +1595,11 @@ namespace OpenCortex.CortexUSB
             lock (_stateLock) { currentlyMuted = _currentState.Tuner.Mute; }
             if (!currentlyMuted)
             {
-                Console.WriteLine("[ProtocolService] Restore audio: tuner mute preference already off, nothing to do");
+                _logger.LogDebug("[ProtocolService] Restore audio: tuner mute preference already off, nothing to do");
                 return false;
             }
 
-            Console.WriteLine("[ProtocolService] Restoring audio — clearing tuner mute preference");
+            _logger.LogInformation("[ProtocolService] Restoring audio — clearing tuner mute preference");
             return await SetTunerMuteAsync(false);
         }
 
@@ -1596,9 +1615,9 @@ namespace OpenCortex.CortexUSB
             catch { message = null; return false; }
         }
 
-        private static bool LogNotConnected(string op)
+        private bool LogNotConnected(string op)
         {
-            Console.WriteLine($"[ProtocolService] Cannot {op} - not connected");
+            _logger.LogWarning("[ProtocolService] Cannot {Operation} - not connected", op);
             return false;
         }
 
@@ -1634,7 +1653,7 @@ namespace OpenCortex.CortexUSB
         /// Row/column may arrive without field presence, in which case the index in the
         /// repeated field is the position (same convention as pyquadcortex's blocks()).
         /// </summary>
-        private static bool GridEchoConfirmsBypass(byte[] payload, int row, int col, bool bypassed)
+        private bool GridEchoConfirmsBypass(byte[] payload, int row, int col, bool bypassed)
         {
             try
             {
@@ -1653,7 +1672,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing grid echo (bypass): {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (bypass)");
             }
             return false;
         }
@@ -1663,7 +1682,7 @@ namespace OpenCortex.CortexUSB
         /// approximately <paramref name="value"/>. Same presence-fallback convention as
         /// <see cref="GridEchoConfirmsBypass"/>.
         /// </summary>
-        private static bool GridEchoConfirmsParam(byte[] payload, int row, int col, int paramIndex, float value)
+        private bool GridEchoConfirmsParam(byte[] payload, int row, int col, int paramIndex, float value)
         {
             try
             {
@@ -1689,7 +1708,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing grid echo (param): {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (param)");
             }
             return false;
         }
@@ -1697,7 +1716,7 @@ namespace OpenCortex.CortexUSB
         /// <summary>
         /// Whether a Grid echo confirms a block with <paramref name="modelHash"/> at [row][col].
         /// </summary>
-        private static bool GridEchoConfirmsBlock(byte[] payload, int row, int col, uint modelHash)
+        private bool GridEchoConfirmsBlock(byte[] payload, int row, int col, uint modelHash)
         {
             try
             {
@@ -1716,7 +1735,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing grid echo (block): {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (block)");
             }
             return false;
         }
@@ -1724,7 +1743,7 @@ namespace OpenCortex.CortexUSB
         /// <summary>
         /// Whether a Grid echo confirms the block at [row][col] is gone (cell absent or hash zeroed).
         /// </summary>
-        private static bool GridEchoConfirmsRemoved(byte[] payload, int row, int col)
+        private bool GridEchoConfirmsRemoved(byte[] payload, int row, int col)
         {
             try
             {
@@ -1745,7 +1764,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing grid echo (remove): {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (remove)");
             }
             return false;
         }
@@ -1754,7 +1773,7 @@ namespace OpenCortex.CortexUSB
         /// Whether a Grid echo carries chain <paramref name="row"/> satisfying <paramref name="check"/>
         /// (used for in_portid / out_portid / split_control_points confirmations).
         /// </summary>
-        private static bool GridEchoConfirmsChainField(byte[] payload, int row, Func<Chain, bool> check)
+        private bool GridEchoConfirmsChainField(byte[] payload, int row, Func<Chain, bool> check)
         {
             try
             {
@@ -1768,7 +1787,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing grid echo (chain): {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (chain)");
             }
             return false;
         }
@@ -1798,7 +1817,7 @@ namespace OpenCortex.CortexUSB
         /// </summary>
         private void MessageProcessorLoop()
         {
-            Console.WriteLine("[ProtocolService] Message processor thread started");
+            _logger.LogDebug("[ProtocolService] Message processor thread started");
 
             Dictionary<uint, int> messageCounters = new();
 
@@ -1814,7 +1833,7 @@ namespace OpenCortex.CortexUSB
                         // Log message frequency every 100 messages
                         if (messageCounters.Values.Sum() % 100 == 0)
                         {
-                            Console.WriteLine($"[ProtocolService] 📊 Message counts: {string.Join(", ", messageCounters.Select(kv => $"{kv.Key}:{kv.Value}"))}");
+                            _logger.LogDebug("[ProtocolService] Message counts: {Counts}", string.Join(", ", messageCounters.Select(kv => $"{kv.Key}:{kv.Value}")));
                         }
 
                         ProcessIncomingMessage(message);
@@ -1826,11 +1845,11 @@ namespace OpenCortex.CortexUSB
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ProtocolService] Error processing message: {ex.Message}");
+                    _logger.LogWarning(ex, "[ProtocolService] Error processing message");
                 }
             }
 
-            Console.WriteLine("[ProtocolService] Message processor thread stopped");
+            _logger.LogDebug("[ProtocolService] Message processor thread stopped");
         }
 
         /// <summary>
@@ -1838,7 +1857,7 @@ namespace OpenCortex.CortexUSB
         /// </summary>
         private void ProcessIncomingMessage(WirePayload message)
         {
-            Console.WriteLine($"[ProtocolService] 📨 Received message type {message.MessageType}, payload: {message.Payload.Length} bytes");
+            _logger.LogDebug("[ProtocolService] Received message type {MessageType}, payload: {ByteCount} bytes", message.MessageType, message.Payload.Length);
 
             bool stateChanged;
             lock (_stateLock)
@@ -1848,7 +1867,7 @@ namespace OpenCortex.CortexUSB
 
             if (stateChanged)
             {
-                Console.WriteLine($"[ProtocolService] ✅ State changed, firing event: Scene={_currentState.Scene}, BPM={_currentState.Bpm}, Mode={_currentState.Mode}");
+                _logger.LogDebug("[ProtocolService] State changed, firing event: Scene={Scene}, BPM={Bpm}, Mode={Mode}", _currentState.Scene, _currentState.Bpm, _currentState.Mode);
                 FireStateChanged(StateUpdate.FromDevice(_currentState));
             }
         }
@@ -1918,12 +1937,12 @@ namespace OpenCortex.CortexUSB
                 GlobalEqState updated = eq with { Bypassed = bypassed, OutputLevel = outputLevel, Out12 = out12, Out34 = out34, Bands = bands };
                 if (updated == eq) return false;
                 _currentState = _currentState with { GlobalEq = updated, Timestamp = DateTime.UtcNow };
-                Console.WriteLine("[ProtocolService] GlobalEQ state updated");
+                _logger.LogDebug("[ProtocolService] GlobalEQ state updated");
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing GlobalEQ message: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing GlobalEQ message");
                 return false;
             }
         }
@@ -1937,12 +1956,12 @@ namespace OpenCortex.CortexUSB
                 if (Math.Abs(msg.Volume - _currentState.MasterVolume.Volume) < 0.0005f) return false;
 
                 _currentState = _currentState with { MasterVolume = new MasterVolumeState { Volume = msg.Volume }, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] MasterVolume updated to {msg.Volume:0.###}");
+                _logger.LogDebug("[ProtocolService] MasterVolume updated to {Volume:0.###}", msg.Volume);
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing MasterVolume message: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing MasterVolume message");
                 return false;
             }
         }
@@ -1967,12 +1986,12 @@ namespace OpenCortex.CortexUSB
                 if (updated == current) return false;
 
                 _currentState = _currentState with { Tuner = updated, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] Tuner state updated: input={updated.InputPortId}, mute={updated.Mute}");
+                _logger.LogDebug("[ProtocolService] Tuner state updated: input={InputPortId}, mute={Mute}", updated.InputPortId, updated.Mute);
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing Tuner message: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing Tuner message");
                 return false;
             }
         }
@@ -1980,10 +1999,10 @@ namespace OpenCortex.CortexUSB
         private bool HandleSceneMessage(WirePayload message)
         {
             int scene = ParseSceneMessage(message.Payload);
-            Console.WriteLine($"[ProtocolService] 🎬 Parsed scene value: {scene}, current: {_currentState.Scene}");
+            _logger.LogDebug("[ProtocolService] Parsed scene value: {Scene}, current: {CurrentScene}", scene, _currentState.Scene);
             if (scene >= 0 && scene != _currentState.Scene)
             {
-                Console.WriteLine($"[ProtocolService] 🎯 SCENE CHANGE: {_currentState.Scene} → {scene}");
+                _logger.LogInformation("[ProtocolService] Scene change: {OldScene} -> {NewScene}", _currentState.Scene, scene);
                 _currentState = _currentState with { Scene = scene, Timestamp = DateTime.UtcNow };
                 if (_currentPreset != null)
                 {
@@ -1995,14 +2014,14 @@ namespace OpenCortex.CortexUSB
                         Bpm = bpm > 0 ? bpm : _currentState.Bpm,
                         Timestamp = DateTime.UtcNow
                     };
-                    if (bpm > 0) Console.WriteLine($"[ProtocolService] BPM from preset scene={scene}: {bpm}");
+                    if (bpm > 0) _logger.LogDebug("[ProtocolService] BPM from preset scene={Scene}: {Bpm}", scene, bpm);
                 }
-                Console.WriteLine($"[ProtocolService] Scene updated to {scene}");
+                _logger.LogDebug("[ProtocolService] Scene updated to {Scene}", scene);
                 return true;
             }
             if (scene < 0)
             {
-                Console.WriteLine($"[ProtocolService] ⚠️ Failed to parse scene from payload: {Convert.ToHexString(message.Payload)}");
+                _logger.LogWarning("[ProtocolService] Failed to parse scene from payload: {Payload}", Convert.ToHexString(message.Payload));
             }
             return false;
         }
@@ -2013,7 +2032,7 @@ namespace OpenCortex.CortexUSB
             if (mode >= 0 && mode != _currentState.Mode)
             {
                 _currentState = _currentState with { Mode = mode, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] Mode updated to {DeviceMode.GetModeName(mode)}");
+                _logger.LogDebug("[ProtocolService] Mode updated to {Mode}", DeviceMode.GetModeName(mode));
                 return true;
             }
             return false;
@@ -2033,7 +2052,7 @@ namespace OpenCortex.CortexUSB
             if (maybeBpm > 0 && maybeBpm != _currentState.Bpm)
             {
                 _currentState = _currentState with { Bpm = maybeBpm, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] BPM updated to {maybeBpm}");
+                _logger.LogDebug("[ProtocolService] BPM updated to {Bpm}", maybeBpm);
                 return true;
             }
             return false;
@@ -2045,7 +2064,7 @@ namespace OpenCortex.CortexUSB
             if (presetInfo != null)
             {
                 _currentState = _currentState with { CurrentPreset = presetInfo, Timestamp = DateTime.UtcNow };
-                Console.WriteLine($"[ProtocolService] Preset position updated to {presetInfo.PresetIndex}");
+                _logger.LogDebug("[ProtocolService] Preset position updated to {PresetIndex}", presetInfo.PresetIndex);
                 return true;
             }
             return false;
@@ -2070,7 +2089,7 @@ namespace OpenCortex.CortexUSB
                 Bpm = bpm > 0 ? bpm : _currentState.Bpm,
                 Timestamp = DateTime.UtcNow
             };
-            Console.WriteLine($"[ProtocolService] RecallPreset updated, BPM={bpm}");
+            _logger.LogDebug("[ProtocolService] RecallPreset updated, BPM={Bpm}", bpm);
             return true;
         }
 
@@ -2095,7 +2114,7 @@ namespace OpenCortex.CortexUSB
 
             _grid = BuildGrid(_currentPreset, _currentState.Scene);
             _currentState = _currentState with { Grid = _grid, Timestamp = DateTime.UtcNow };
-            Console.WriteLine("[ProtocolService] Grid updated");
+            _logger.LogDebug("[ProtocolService] Grid updated");
             return true;
         }
 
@@ -2210,7 +2229,7 @@ namespace OpenCortex.CortexUSB
         /// </summary>
         private bool HandleNewModels()
         {
-            Console.WriteLine("[ProtocolService] NewModels notification received - re-requesting ModelRepo");
+            _logger.LogDebug("[ProtocolService] NewModels notification received - re-requesting ModelRepo");
             SendCommand(ProtocolMessages.BuildModelRepoRequest(), MessageTypes.ModelRepo);
             return false;
         }
@@ -2227,7 +2246,7 @@ namespace OpenCortex.CortexUSB
                 _grid = BuildGrid(_currentPreset, _currentState.Scene);
                 _currentState = _currentState with { Grid = _grid, Timestamp = DateTime.UtcNow };
             }
-            Console.WriteLine($"[ProtocolService] ModelRepo parsed: {_modelMap.Count} models");
+            _logger.LogDebug("[ProtocolService] ModelRepo parsed: {ModelCount} models", _modelMap.Count);
             return true;
         }
 
@@ -2266,8 +2285,8 @@ namespace OpenCortex.CortexUSB
 
         private bool HandlePresetDirty()
         {
-            Console.WriteLine("[ProtocolService] 🚨 PresetDirty notification - hardware changes detected!");
-            Console.WriteLine("[ProtocolService] 🔄 Re-querying scene state due to PresetDirty...");
+            _logger.LogDebug("[ProtocolService] PresetDirty notification - hardware changes detected");
+            _logger.LogDebug("[ProtocolService] Re-querying scene state due to PresetDirty...");
 
             _ = Task.Run(async () =>
             {
@@ -2277,18 +2296,18 @@ namespace OpenCortex.CortexUSB
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ProtocolService] Error querying scene after PresetDirty: {ex.Message}");
+                    _logger.LogWarning(ex, "[ProtocolService] Error querying scene after PresetDirty");
                 }
             });
             return false;
         }
 
-        private static bool HandleUnknownMessage(WirePayload message)
+        private bool HandleUnknownMessage(WirePayload message)
         {
-            Console.WriteLine($"[ProtocolService] ⚠️ UNHANDLED message type {message.MessageType} - payload: {Convert.ToHexString(message.Payload.Take(20).ToArray())}...");
+            _logger.LogWarning("[ProtocolService] Unhandled message type {MessageType} - payload: {Payload}...", message.MessageType, Convert.ToHexString(message.Payload.Take(20).ToArray()));
             if (message.MessageType == 34)
             {
-                Console.WriteLine("[ProtocolService] 🎯 PRESET DIRTY notification received - might indicate scene change!");
+                _logger.LogDebug("[ProtocolService] PRESET DIRTY notification received - might indicate scene change");
             }
             return false;
         }
@@ -2308,7 +2327,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing SetlistPosition: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing SetlistPosition");
                 return null;
             }
         }
@@ -2326,7 +2345,7 @@ namespace OpenCortex.CortexUSB
             };
         }
 
-        private static BinaryPreset? ParseRecallPreset(byte[] payload)
+        private BinaryPreset? ParseRecallPreset(byte[] payload)
         {
             try
             {
@@ -2336,12 +2355,12 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing RecallPreset: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing RecallPreset");
                 return null;
             }
         }
 
-        private static BinaryPreset? ParseGridMessage(byte[] payload)
+        private BinaryPreset? ParseGridMessage(byte[] payload)
         {
             try
             {
@@ -2351,12 +2370,12 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing Grid: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing Grid");
                 return null;
             }
         }
 
-        private static Dictionary<int, ModelInfo> ParseModelRepo(byte[] payload)
+        private Dictionary<int, ModelInfo> ParseModelRepo(byte[] payload)
         {
             try
             {
@@ -2364,7 +2383,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing ModelRepo: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing ModelRepo");
                 return [];
             }
         }
@@ -2387,7 +2406,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing Version: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing Version");
                 return null;
             }
         }
@@ -2403,7 +2422,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing Connection: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing Connection");
                 return null;
             }
         }
@@ -2437,7 +2456,7 @@ namespace OpenCortex.CortexUSB
                 .ToList();
         }
 
-        private (List<Block> Blocks, List<SplitInfo> Splits) BuildChainBlocks(Chain chain, int rowIndex, int currentScene,
+        private ChainBlocksResult BuildChainBlocks(Chain chain, int rowIndex, int currentScene,
             Dictionary<int, Dictionary<int, Dictionary<int, bool>>> sceneBypasses)
         {
             List<Block> blocks = new();
@@ -2528,7 +2547,7 @@ namespace OpenCortex.CortexUSB
                 });
             }
 
-            return (blocks, splits);
+            return new ChainBlocksResult(blocks, splits);
         }
 
         private static bool ResolveBypassState(
@@ -2730,7 +2749,7 @@ namespace OpenCortex.CortexUSB
 
         private void RebuildPresetLibrary()
         {
-            Console.WriteLine($"[ProtocolService] Rebuilding preset library from {_fileMessages.Count} file messages...");
+            _logger.LogDebug("[ProtocolService] Rebuilding preset library from {FileMessageCount} file messages...", _fileMessages.Count);
             List<PresetDirectory> flatDirs = new();
 
             foreach (byte[] payload in _fileMessages)
@@ -2761,7 +2780,8 @@ namespace OpenCortex.CortexUSB
             }
 
             List<PresetDirectory> presetLibrary = BuildDirectoryTree(flatDirs);
-            Console.WriteLine($"[ProtocolService] Preset library rebuilt: {flatDirs.Count} folders, {presetLibrary.Count} roots, library={_currentState.PresetLibrary.Count} items");
+            _logger.LogDebug("[ProtocolService] Preset library rebuilt: {FolderCount} folders, {RootCount} roots, library={ItemCount} items",
+                flatDirs.Count, presetLibrary.Count, _currentState.PresetLibrary.Count);
             _currentState = _currentState with { PresetLibrary = presetLibrary, Timestamp = DateTime.UtcNow };
             _lastLibraryRebuild = DateTime.UtcNow;
         }
@@ -2795,7 +2815,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing FileMessage: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing FileMessage");
                 return null;
             }
         }
@@ -2876,11 +2896,11 @@ namespace OpenCortex.CortexUSB
         /// Parses scene index from protobuf payload.
         /// Expected format: {f1=1, f3=scene_index} or {f3=scene_index}
         /// </summary>
-        private static int ParseSceneMessage(byte[] payload)
+        private int ParseSceneMessage(byte[] payload)
         {
             try
             {
-                Console.WriteLine($"[ProtocolService] 🔍 Parsing scene from payload: {Convert.ToHexString(payload)} ({payload.Length} bytes)");
+                _logger.LogDebug("[ProtocolService] Parsing scene from payload: {Payload} ({ByteCount} bytes)", Convert.ToHexString(payload), payload.Length);
 
                 // Simple parser: look for field 3 (varint)
                 // Field 3 tag = (3 << 3) | 0 = 24 (0x18)
@@ -2890,16 +2910,16 @@ namespace OpenCortex.CortexUSB
                     {
                         // Next byte is the scene index (assuming < 128)
                         int sceneValue = payload[i + 1];
-                        Console.WriteLine($"[ProtocolService] 🎯 Found scene field at offset {i}: value = {sceneValue}");
+                        _logger.LogDebug("[ProtocolService] Found scene field at offset {Offset}: value = {SceneValue}", i, sceneValue);
                         return sceneValue;
                     }
                 }
 
-                Console.WriteLine("[ProtocolService] ❌ No scene field (0x18) found in payload");
+                _logger.LogWarning("[ProtocolService] No scene field (0x18) found in payload");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing scene: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing scene");
             }
             return -1;
         }
@@ -2908,7 +2928,7 @@ namespace OpenCortex.CortexUSB
         /// Parses mode from protobuf payload.
         /// Expected format: {f1=1, f3=mode} or {f3=mode}
         /// </summary>
-        private static int ParseModeMessage(byte[] payload)
+        private int ParseModeMessage(byte[] payload)
         {
             try
             {
@@ -2924,7 +2944,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing mode: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing mode");
             }
             return -1;
         }
@@ -2944,7 +2964,7 @@ namespace OpenCortex.CortexUSB
         /// float (bpm = 40 + 200 * float). Metronome heartbeats carry
         /// MetronomeStatus.CurrentBeat (1-3), not BPM.
         /// </summary>
-        private static int ParseTempoMessage(byte[] payload)
+        private int ParseTempoMessage(byte[] payload)
         {
             try
             {
@@ -2970,7 +2990,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error parsing tempo message: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing tempo message");
             }
             return -1;
         }
@@ -2983,11 +3003,11 @@ namespace OpenCortex.CortexUSB
             // Skip events during initialization to prevent spam
             if (_suppressStateEvents)
             {
-                Console.WriteLine($"[ProtocolService] Suppressing state event during init: {update.ChangeType}");
+                _logger.LogDebug("[ProtocolService] Suppressing state event during init: {ChangeType}", update.ChangeType);
                 return;
             }
 
-            Console.WriteLine($"[ProtocolService] ✅ Firing state change event: {update.ChangeType}, Scene={update.State.Scene}, BPM={update.State.Bpm}");
+            _logger.LogDebug("[ProtocolService] Firing state change event: {ChangeType}, Scene={Scene}, BPM={Bpm}", update.ChangeType, update.State.Scene, update.State.Bpm);
 
             try
             {
@@ -2995,7 +3015,7 @@ namespace OpenCortex.CortexUSB
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Error firing state changed event: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Error firing state changed event");
             }
         }
 
@@ -3011,7 +3031,7 @@ namespace OpenCortex.CortexUSB
             try
             {
                 // Only query scene changes - the most common hardware interaction
-                Console.WriteLine("[ProtocolService] 🔍 Checking for scene changes...");
+                _logger.LogDebug("[ProtocolService] Checking for scene changes...");
 
                 int oldScene = _currentState.Scene;
                 await QueryStateFieldAsync(MessageTypes.Scene, "Scene", TimeSpan.FromSeconds(2));
@@ -3021,12 +3041,12 @@ namespace OpenCortex.CortexUSB
 
                 if (_currentState.Scene != oldScene)
                 {
-                    Console.WriteLine($"[ProtocolService] 🎯 Scene change confirmed: {oldScene} → {_currentState.Scene}");
+                    _logger.LogDebug("[ProtocolService] Scene change confirmed: {OldScene} -> {NewScene}", oldScene, _currentState.Scene);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ProtocolService] Scene polling error: {ex.Message}");
+                _logger.LogWarning(ex, "[ProtocolService] Scene polling error");
             }
         }
 
@@ -3045,7 +3065,7 @@ namespace OpenCortex.CortexUSB
             {
                 _isConnected = false;
 
-                Console.WriteLine("[ProtocolService] Disposing...");
+                _logger.LogDebug("[ProtocolService] Disposing...");
 
                 _statePollingTimer?.Change(Timeout.Infinite, Timeout.Infinite);
                 _statePollingTimer?.Dispose();
@@ -3060,7 +3080,7 @@ namespace OpenCortex.CortexUSB
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ProtocolService] Error stopping message processor: {ex.Message}");
+                    _logger.LogWarning(ex, "[ProtocolService] Error stopping message processor");
                 }
 
                 _cts.Dispose();

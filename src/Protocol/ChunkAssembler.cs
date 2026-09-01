@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
+using OpenCortex.CortexUSB.Client;
 
 namespace OpenCortex.CortexUSB
 {
@@ -35,6 +37,13 @@ namespace OpenCortex.CortexUSB
         private volatile int _totalChunksProcessed;
         private volatile int _messagesAssembled;
 
+        private readonly ILogger<ChunkAssembler> _logger;
+
+        public ChunkAssembler(ILogger<ChunkAssembler>? logger = null)
+        {
+            _logger = logger ?? new SimpleConsoleLogger<ChunkAssembler>();
+        }
+
         /// <summary>
         /// Processes a single HID report chunk.
         ///
@@ -68,7 +77,7 @@ namespace OpenCortex.CortexUSB
                 // Validate payload length
                 if (payloadLength > MAX_PAYLOAD_PER_CHUNK)
                 {
-                    Console.WriteLine($"[ChunkAssembler] Warning: payload length {payloadLength} exceeds max {MAX_PAYLOAD_PER_CHUNK}, clamping");
+                    _logger.LogWarning("[ChunkAssembler] Warning: payload length {PayloadLength} exceeds max {MaxPayloadPerChunk}, clamping", payloadLength, MAX_PAYLOAD_PER_CHUNK);
                     payloadLength = MAX_PAYLOAD_PER_CHUNK;
                 }
 
@@ -99,7 +108,7 @@ namespace OpenCortex.CortexUSB
                 {
                     if (_assembling)
                     {
-                        Console.WriteLine($"[ChunkAssembler] Warning: new FIRST chunk while assembling, discarding {_buffer.Count} buffered bytes");
+                        _logger.LogWarning("[ChunkAssembler] Warning: new FIRST chunk while assembling, discarding {BufferedByteCount} buffered bytes", _buffer.Count);
                     }
                     _buffer.Clear();
                     _buffer.AddRange(payload);
@@ -110,7 +119,7 @@ namespace OpenCortex.CortexUSB
                 // ── Middle or LAST chunk ──────────────────────────────────────────────
                 if (!_assembling)
                 {
-                    Console.WriteLine("[ChunkAssembler] Warning: received continuation chunk without active assembly — ignoring");
+                    _logger.LogWarning("[ChunkAssembler] Warning: received continuation chunk without active assembly — ignoring");
                     return null;
                 }
 

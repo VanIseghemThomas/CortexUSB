@@ -1,6 +1,8 @@
 using HidSharp;
 using System.Collections.Concurrent;
 using System.Linq;
+using Microsoft.Extensions.Logging;
+using OpenCortex.CortexUSB.Client;
 
 namespace OpenCortex.CortexUSB
 {
@@ -17,6 +19,11 @@ namespace OpenCortex.CortexUSB
         private const byte REPORT_ID_OUTPUT = 0x02;
         private const int QUEUE_CAPACITY = 1024;
 
+        // Used only by the static EnumerateDevices() helper, which has no instance to carry a
+        // per-call logger for. Kept separate from the instance _logger below.
+        private static readonly ILogger<UsbTransport> _staticLogger = new SimpleConsoleLogger<UsbTransport>();
+
+        private readonly ILogger<UsbTransport> _logger;
         private HidStream? _stream;
         private readonly ConcurrentQueue<byte[]> _incomingReports = new();
         private CancellationTokenSource _cancellationTokenSource = new();
@@ -26,6 +33,11 @@ namespace OpenCortex.CortexUSB
         private volatile int _overflowCount;
         private bool _disposed;
         private volatile string? _openDevicePath;
+
+        public UsbTransport(ILogger<UsbTransport>? logger = null)
+        {
+            _logger = logger ?? new SimpleConsoleLogger<UsbTransport>();
+        }
 
         public bool IsConnected => _stream != null && _stream.CanRead && !_disposed;
         public int QueuedReports => _incomingReports.Count;
@@ -54,13 +66,13 @@ namespace OpenCortex.CortexUSB
 
                 if (!stillPresent)
                 {
-                    Console.WriteLine("[UsbTransport] ⚡ Device removal detected (instant, via OS device-list change)");
+                    _logger.LogInformation("[UsbTransport] Device removal detected (instant, via OS device-list change)");
                     DeviceRemoved?.Invoke();
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[UsbTransport] DeviceListChanged handler error: {ex.Message}");
+                _logger.LogWarning(ex, "[UsbTransport] DeviceListChanged handler error");
             }
         }
 
@@ -84,9 +96,9 @@ namespace OpenCortex.CortexUSB
                         string? product = null;
                         string? serialNumber = null;
                     
-                        try { manufacturer = device.GetManufacturer(); } catch (Exception ex) { Console.WriteLine($"[UsbTransport] GetManufacturer failed: {ex.Message}"); }
-                        try { product = device.GetProductName(); } catch (Exception ex) { Console.WriteLine($"[UsbTransport] GetProductName failed: {ex.Message}"); }
-                        try { serialNumber = device.GetSerialNumber(); } catch (Exception ex) { Console.WriteLine($"[UsbTransport] GetSerialNumber failed: {ex.Message}"); }
+                        try { manufacturer = device.GetManufacturer(); } catch (Exception ex) { _staticLogger.LogWarning(ex, "[UsbTransport] GetManufacturer failed"); }
+                        try { product = device.GetProductName(); } catch (Exception ex) { _staticLogger.LogWarning(ex, "[UsbTransport] GetProductName failed"); }
+                        try { serialNumber = device.GetSerialNumber(); } catch (Exception ex) { _staticLogger.LogWarning(ex, "[UsbTransport] GetSerialNumber failed"); }
                     
                         devices.Add(new UsbDeviceInfo
                         {
@@ -100,13 +112,13 @@ namespace OpenCortex.CortexUSB
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[UsbTransport] Error getting device info: {ex.Message}");
+                        _staticLogger.LogWarning(ex, "[UsbTransport] Error getting device info");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[UsbTransport] Error enumerating devices: {ex.Message}");
+                _staticLogger.LogWarning(ex, "[UsbTransport] Error enumerating devices");
             }
 
             return devices;
@@ -119,7 +131,7 @@ namespace OpenCortex.CortexUSB
         {
             if (IsConnected)
             {
-                Console.WriteLine("[UsbTransport] Device already open");
+                _logger.LogDebug("[UsbTransport] Device already open");
                 return true;
             }
 
@@ -132,10 +144,10 @@ namespace OpenCortex.CortexUSB
                 {
                     try
                     {
-                        Console.WriteLine($"[UsbTransport] Found device: {device.GetProductName()}");
-                        Console.WriteLine($"[UsbTransport] Path: {device.DevicePath}");
-                        Console.WriteLine($"[UsbTransport] Max input: {device.GetMaxInputReportLength()}");
-                        Console.WriteLine($"[UsbTransport] Max output: {device.GetMaxOutputReportLength()}");
+                        _logger.LogDebug("[UsbTransport] Found device: {Product}", device.GetProductName());
+                        _logger.LogDebug("[UsbTransport] Path: {DevicePath}", device.DevicePath);
+                        _logger.LogDebug("[UsbTransport] Max input: {MaxInput}", device.GetMaxInputReportLength());
+                        _logger.LogDebug("[UsbTransport] Max output: {MaxOutput}", device.GetMaxOutputReportLength());
 
                         // Try to open the device
                         if (device.TryOpen(out _stream))
@@ -151,26 +163,26 @@ namespace OpenCortex.CortexUSB
                             _openDevicePath = device.DevicePath;
                             DeviceList.Local.Changed += OnDeviceListChanged;
 
-                            Console.WriteLine("[UsbTransport] ✅ Device opened successfully");
+                            _logger.LogInformation("[UsbTransport] Device opened successfully");
                             return true;
                         }
                         else
                         {
-                            Console.WriteLine("[UsbTransport] Failed to open device stream");
+                            _logger.LogWarning("[UsbTransport] Failed to open device stream");
                         }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[UsbTransport] Error opening device: {ex.Message}");
+                        _logger.LogWarning(ex, "[UsbTransport] Error opening device");
                     }
                 }
 
-                Console.WriteLine("[UsbTransport] No Quad Cortex device found or accessible");
+                _logger.LogWarning("[UsbTransport] No Quad Cortex device found or accessible");
                 return false;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[UsbTransport] Error during device discovery: {ex.Message}");
+                _logger.LogWarning(ex, "[UsbTransport] Error during device discovery");
                 return false;
             }
         }
@@ -183,19 +195,19 @@ namespace OpenCortex.CortexUSB
         {
             if (!IsConnected)
             {
-                Console.WriteLine("[UsbTransport] Cannot write: device not connected");
+                _logger.LogWarning("[UsbTransport] Cannot write: device not connected");
                 return false;
             }
 
             if (data.Length != REPORT_SIZE)
             {
-                Console.WriteLine($"[UsbTransport] Invalid report size: {data.Length}, expected {REPORT_SIZE}");
+                _logger.LogWarning("[UsbTransport] Invalid report size: {ActualSize}, expected {ExpectedSize}", data.Length, REPORT_SIZE);
                 return false;
             }
 
             if (data[0] != REPORT_ID_OUTPUT)
             {
-                Console.WriteLine($"[UsbTransport] Warning: Report ID is 0x{data[0]:X2}, expected 0x{REPORT_ID_OUTPUT:X2}");
+                _logger.LogWarning("[UsbTransport] Report ID is 0x{ActualId:X2}, expected 0x{ExpectedId:X2}", data[0], REPORT_ID_OUTPUT);
             }
 
             lock (_writeLock)
@@ -211,18 +223,18 @@ namespace OpenCortex.CortexUSB
                 {
                     // CRITICAL: IOException with STALL is EXPECTED behavior!
                     // The device processes the data even though it returns STALL error
-                    Console.WriteLine($"[UsbTransport] Write IOException (may be expected STALL): {ioEx.Message}");
+                    _logger.LogWarning(ioEx, "[UsbTransport] Write IOException (may be expected STALL)");
                     return true; // Treat as success - device quirk
                 }
-                catch (TimeoutException)
+                catch (TimeoutException ex)
                 {
                     // Timeout during write might also mean STALL - treat as success
-                    Console.WriteLine($"[UsbTransport] Write timeout");
+                    _logger.LogWarning(ex, "[UsbTransport] Write timeout");
                     return true;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[UsbTransport] Write exception: {ex.GetType().Name} - {ex.Message}");
+                    _logger.LogWarning(ex, "[UsbTransport] Write exception: {ExceptionType}", ex.GetType().Name);
                     // For any other exception, assume it worked (device quirk)
                     return true;
                 }
@@ -270,7 +282,7 @@ namespace OpenCortex.CortexUSB
             if (_stream == null && _readerTask == null) return;
 
             try { _cancellationTokenSource.Cancel(); }
-            catch (Exception ex) { Console.WriteLine($"[UsbTransport] Close: cancel failed: {ex.Message}"); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[UsbTransport] Close: cancel failed"); }
 
             try { _readerTask?.Wait(TimeSpan.FromSeconds(1)); }
             catch { /* reader may not respond promptly to a dead stream; expected */ }
@@ -287,7 +299,7 @@ namespace OpenCortex.CortexUSB
 
             while (_incomingReports.TryDequeue(out _)) { }
 
-            Console.WriteLine("[UsbTransport] Closed (ready for reopen)");
+            _logger.LogInformation("[UsbTransport] Closed (ready for reopen)");
         }
 
         /// <summary>
@@ -295,7 +307,7 @@ namespace OpenCortex.CortexUSB
         /// </summary>
         private void ReaderLoop(CancellationToken cancellationToken)
         {
-            Console.WriteLine("[UsbTransport] Reader thread started");
+            _logger.LogDebug("[UsbTransport] Reader thread started");
             byte[] buffer = new byte[REPORT_SIZE];
 
             while (!cancellationToken.IsCancellationRequested && _stream != null)
@@ -320,7 +332,7 @@ namespace OpenCortex.CortexUSB
                         else
                         {
                             Interlocked.Increment(ref _overflowCount);
-                            Console.WriteLine("[UsbTransport] ⚠️ Queue overflow! Report dropped.");
+                            _logger.LogWarning("[UsbTransport] Queue overflow! Report dropped.");
                         }
                     }
                 }
@@ -332,7 +344,7 @@ namespace OpenCortex.CortexUSB
                 {
                     if (!cancellationToken.IsCancellationRequested)
                     {
-                        Console.WriteLine($"[UsbTransport] IO error in reader: {ioEx.Message}");
+                        _logger.LogWarning(ioEx, "[UsbTransport] IO error in reader");
                         Thread.Sleep(100);
                     }
                 }
@@ -340,13 +352,13 @@ namespace OpenCortex.CortexUSB
                 {
                     if (!cancellationToken.IsCancellationRequested)
                     {
-                        Console.WriteLine($"[UsbTransport] Reader exception: {ex.Message}");
+                        _logger.LogWarning(ex, "[UsbTransport] Reader exception");
                         Thread.Sleep(100);
                     }
                 }
             }
 
-            Console.WriteLine("[UsbTransport] Reader thread stopped");
+            _logger.LogDebug("[UsbTransport] Reader thread stopped");
         }
 
         public void Dispose()
@@ -364,7 +376,7 @@ namespace OpenCortex.CortexUSB
             {
                 Close();
                 _cancellationTokenSource.Dispose();
-                Console.WriteLine("[UsbTransport] Disposed");
+                _logger.LogDebug("[UsbTransport] Disposed");
             }
         }
     }

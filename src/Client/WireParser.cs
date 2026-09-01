@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using System;
 using System.Collections.Generic;
+using Microsoft.Extensions.Logging;
 
 namespace OpenCortex.CortexUSB.Client
 {
@@ -23,6 +24,8 @@ namespace OpenCortex.CortexUSB.Client
     public class WireParser
     {
         private const int TRAILER_SIZE = 8;
+
+        private static readonly ILogger _logger = new SimpleConsoleLogger<WireParser>();
 
         private static readonly HashSet<uint> _skipCompressedTypes = LoadSkipCompressedTypes();
 
@@ -76,7 +79,7 @@ namespace OpenCortex.CortexUSB.Client
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[WireParser] AES-GCM decrypt failed, returning raw encrypted payload: {ex.Message}");
+                        _logger.LogWarning(ex, "[WireParser] AES-GCM decrypt failed, returning raw encrypted payload");
                         // leave payload as-is (encrypted)
                     }
                 }
@@ -90,7 +93,7 @@ namespace OpenCortex.CortexUSB.Client
             {
                 if (_skipCompressedTypes.Contains(messageType))
                 {
-                    Console.WriteLine($"[WireParser] Skipping decompression for messageType={messageType} (compressed flag set)");
+                    _logger.LogDebug("[WireParser] Skipping decompression for messageType={MessageType} (compressed flag set)", messageType);
                 }
                 else
                 {
@@ -121,7 +124,7 @@ namespace OpenCortex.CortexUSB.Client
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[WireParser] DecompressGzip failed at depth {depth}: {ex.Message}");
+                        _logger.LogWarning(ex, "[WireParser] DecompressGzip failed at depth {Depth}", depth);
                         return data;
                     }
                 }
@@ -135,7 +138,7 @@ namespace OpenCortex.CortexUSB.Client
                 {
                     if (depth == 0)
                     {
-                        Console.WriteLine($"[WireParser] DecompressZlib failed at depth {depth}: {ex.Message}");
+                        _logger.LogWarning(ex, "[WireParser] DecompressZlib failed at depth {Depth}", depth);
                         return data;
                     }
                     break;
@@ -165,7 +168,7 @@ namespace OpenCortex.CortexUSB.Client
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[WireParser] TryDecompressNestedGzip failed at offset {i}: {ex.Message}");
+                        _logger.LogWarning(ex, "[WireParser] TryDecompressNestedGzip failed at offset {Offset}", i);
                     }
                 }
             }
