@@ -3,8 +3,32 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - '**.cs'
+      - '**.csproj'
+      - '**.sln'
+      - '**.slnx'
+      - '**.props'
+      - '**.targets'
+      - '**.resx'
+      - '**global.json'
+      - '**NuGet.config'
+      - 'Directory.Build.props'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
+    paths:
+      - '**.cs'
+      - '**.csproj'
+      - '**.sln'
+      - '**.slnx'
+      - '**.props'
+      - '**.targets'
+      - '**.resx'
+      - '**global.json'
+      - '**NuGet.config'
+      - 'Directory.Build.props'
+      - '.github/workflows/ci.yml'
 
 jobs:
   build:
