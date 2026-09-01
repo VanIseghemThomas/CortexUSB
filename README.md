@@ -5,32 +5,6 @@ device discovery, the crypto handshake, chunked/compressed protobuf framing,
 and a clean high-level API for presets, scenes, and signal-chain grid
 editing.
 
-This library only talks to the device over USB. It has no opinions about
-how you expose that to the outside world — see
-[CortexBridge](https://github.com/VanIseghemThomas/CortexBridge) for a
-WebSocket server built on top of it, or
-[CortexMCP](https://github.com/VanIseghemThomas/CortexMCP) for an MCP server
-built on top of it.
-
-## Install
-
-```bash
-dotnet add package CortexUSB
-```
-
-## Quick start
-
-```csharp
-using OpenCortex.CortexUSB;
-
-using var cortex = new QuadCortex();
-if (await cortex.ConnectAsync())
-{
-    var state = await cortex.RefreshCurrentStateAsync();
-    Console.WriteLine($"Current preset: {state?.CurrentPreset?.Name}");
-}
-```
-
 `QuadCortex` is the intended entry point — it wraps the lower-level
 `ProtocolClient` (wire framing, crypto, chunking) and `ProtocolService`
 (state caching, preset library, grid editing) and exposes only clean
@@ -48,6 +22,16 @@ domain types. No protobuf, wire, or HID types leak out of it.
 - **`QuadCortex.cs`** / **`ProtocolService.cs`** — the high-level facade and
   the state/preset/grid logic behind it.
 
+## Samples
+
+`samples/ListPresets` and `samples/QueryPreset` are minimal console apps
+demonstrating the library against a connected device:
+
+```bash
+dotnet run --project samples/ListPresets/ListPresets.csproj
+dotnet run --project samples/QueryPreset/QueryPreset.csproj
+```
+
 ## Device quirks worth knowing
 
 - `SET_REPORT` always STALLs on this device but still processes the data
@@ -59,20 +43,10 @@ domain types. No protobuf, wire, or HID types leak out of it.
 - Grid state echoes from the device are sparse deltas — never replace a
   cached grid wholesale from one.
 
-## Samples
 
-`samples/ListPresets` and `samples/QueryPreset` are minimal console apps
-demonstrating the library against a connected device:
+## Acknowledgements
 
-```bash
-dotnet run --project samples/ListPresets/ListPresets.csproj
-dotnet run --project samples/QueryPreset/QueryPreset.csproj
-```
-
-## Testing
-
-See [tests/CortexUSB.Tests/README.md](tests/CortexUSB.Tests/README.md) for
-current test status and the intended testing approach.
+Special thanks to [Simone Margaritelli (a.k.a. EvilSocket)](https://github.com/evilsocket) for the initial research that started all of this and pointing me in the right directions. Also [Jonathan Stokes](https://github.com/stokes-audio) for an incredible reference with the [pyquadcortex](https://github.com/stokes-audio/pyquadcortex) project. Also shoutout to the community over at [OpenCortex](https://discord.com/invite/ef2gBDDSkm).
 
 ## License
 
