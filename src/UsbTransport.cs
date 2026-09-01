@@ -25,7 +25,7 @@ namespace OpenCortex.CortexUSB
         private readonly ILogger<UsbTransport> _logger;
         private HidStream? _stream;
         private readonly ConcurrentQueue<byte[]> _incomingReports = new();
-        private CancellationTokenSource _cancellationTokenSource = new();
+        private CancellationTokenSource _cts = new();
         private Task? _readerTask;
         private readonly object _writeLock = new();
         private volatile int _totalReportsReceived;
@@ -154,7 +154,7 @@ namespace OpenCortex.CortexUSB
                             _stream.ReadTimeout = 200; // 200ms timeout for reads
 
                             // Start background reader thread
-                            _readerTask = Task.Run(() => ReaderLoop(_cancellationTokenSource.Token));
+                            _readerTask = Task.Run(() => ReaderLoop(_cts.Token), _cts.Token);
 
                             // Watch for this exact device disappearing from the OS's HID
                             // device list, so an unplug is detected instantly rather than
@@ -280,10 +280,10 @@ namespace OpenCortex.CortexUSB
         {
             if (_stream == null && _readerTask == null) return;
 
-            try { _cancellationTokenSource.Cancel(); }
+            try { _cts.Cancel(); }
             catch (Exception ex) { _logger.LogWarning(ex, "[UsbTransport] Close: cancel failed"); }
 
-            try { _readerTask?.Wait(TimeSpan.FromSeconds(1)); }
+            try { _readerTask?.Wait(TimeSpan.FromSeconds(1), _cts.Token); }
             catch { /* reader may not respond promptly to a dead stream; expected */ }
             _readerTask = null;
 
@@ -293,10 +293,13 @@ namespace OpenCortex.CortexUSB
             DeviceList.Local.Changed -= OnDeviceListChanged;
             _openDevicePath = null;
 
-            _cancellationTokenSource.Dispose();
-            _cancellationTokenSource = new CancellationTokenSource();
+            _cts.Dispose();
+            _cts = new CancellationTokenSource();
 
-            while (_incomingReports.TryDequeue(out _)) { }
+            while (_incomingReports.TryDequeue(out _))
+            {
+                // NOP
+            }
 
             _logger.LogInformation("[UsbTransport] Closed (ready for reopen)");
         }
@@ -374,7 +377,7 @@ namespace OpenCortex.CortexUSB
             if (disposing)
             {
                 Close();
-                _cancellationTokenSource.Dispose();
+                _cts.Dispose();
                 _logger.LogDebug("[UsbTransport] Disposed");
             }
         }

@@ -2,7 +2,7 @@ using OpenCortex.CortexUSB;
 
 public static class Program
 {
-    private static async Task Main(string[] _)
+    private static async Task Main()
     {
         List<UsbDeviceInfo> devices = UsbTransport.EnumerateDevices();
         if (devices.Count == 0)

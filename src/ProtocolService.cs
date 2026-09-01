@@ -81,6 +81,7 @@ namespace OpenCortex.CortexUSB
         private List<GridRow> _grid = [];
         private BinaryPreset? _currentPreset;
         private readonly List<byte[]> _fileMessages = [];
+        private readonly object _fileMessagesLock = new();
         private DateTime _lastLibraryRebuild = DateTime.MinValue;
         private volatile bool _isConnected;
 
@@ -2252,7 +2253,10 @@ namespace OpenCortex.CortexUSB
 
         private bool HandleFileMessage(WirePayload message)
         {
-            _fileMessages.Add(message.Payload);
+            lock (_fileMessagesLock)
+            {
+                _fileMessages.Add(message.Payload);
+            }
 
             // Throttle: rebuild at most once per 500ms to avoid hammering _stateLock
             // during an initial flood of file messages (the final rebuild is guaranteed
@@ -2298,7 +2302,7 @@ namespace OpenCortex.CortexUSB
                 {
                     _logger.LogWarning(ex, "[ProtocolService] Error querying scene after PresetDirty");
                 }
-            });
+            }, _cts.Token);
             return false;
         }
 
@@ -2724,16 +2728,33 @@ namespace OpenCortex.CortexUSB
                     return;
                 }
 
+                // The device can take several seconds to even start responding (cold
+                // filesystem walk) before it bursts the whole listing through, so the
+                // idle timeout only means "burst is over" once something has actually
+                // arrived — an idle gap before the very first message just means the
+                // device hasn't started yet, and we keep waiting up to maxDuration.
+                //
+                // This loop only watches for traffic to know when to stop waiting —
+                // it doesn't collect the messages itself. HandleFileMessage (driven by
+                // the background message processor, via a fully independent delivery
+                // path) is the sole writer of _fileMessages; collecting here too used
+                // to double up every message and race HandleFileMessage's own writes
+                // from a different thread.
                 DateTime deadline = DateTime.UtcNow + maxDuration;
+                bool receivedAny = false;
                 while (DateTime.UtcNow < deadline)
                 {
                     WirePayload? response = _client.WaitForMessage(MessageTypes.File, idleTimeout);
                     if (response == null)
                     {
-                        break;
+                        if (receivedAny)
+                        {
+                            break;
+                        }
+                        continue;
                     }
 
-                    _fileMessages.Add(response.Payload);
+                    receivedAny = true;
                 }
 
                 RebuildPresetLibrary();
@@ -2749,10 +2770,16 @@ namespace OpenCortex.CortexUSB
 
         private void RebuildPresetLibrary()
         {
-            _logger.LogDebug("[ProtocolService] Rebuilding preset library from {FileMessageCount} file messages...", _fileMessages.Count);
+            List<byte[]> fileMessagesSnapshot;
+            lock (_fileMessagesLock)
+            {
+                fileMessagesSnapshot = [.. _fileMessages];
+            }
+
+            _logger.LogDebug("[ProtocolService] Rebuilding preset library from {FileMessageCount} file messages...", fileMessagesSnapshot.Count);
             List<PresetDirectory> flatDirs = new();
 
-            foreach (byte[] payload in _fileMessages)
+            foreach (byte[] payload in fileMessagesSnapshot)
             {
                 ParsedFolder? folder = ParseFolderInfo(payload);
                 if (folder == null || string.IsNullOrWhiteSpace(folder.Path))

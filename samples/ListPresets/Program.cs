@@ -22,10 +22,11 @@ public static class Program
         }
 
         IReadOnlyList<FlatPreset> presets = cortex.ListPresets();
-        Console.WriteLine($"Found {presets.Count} presets:");
-        foreach (FlatPreset preset in presets)
+        List<string> names = presets.Where(p => !string.IsNullOrWhiteSpace(p.Name)).Select(p => p.Name).Distinct().ToList();
+        Console.WriteLine($"Found {presets.Count} entries, {names.Count} named presets:");
+        foreach (string name in names)
         {
-            Console.WriteLine($" - {preset.Name}");
+            Console.WriteLine($" - {name}");
         }
     }
 }
