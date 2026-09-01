@@ -16,6 +16,10 @@ domain types. No protobuf, wire, or HID types leak out of it.
 dotnet add package CortexUSB
 ```
 
+## Join the community
+
+[![Discord Banner 1](https://discordapp.com/api/guilds/1064519311567360031/widget.png?style=banner2)](https://discord.gg/ef2gBDDSkm)
+
 ## Architecture
 
 - **`Client/`** — transport (`ITransport`, `UsbHidTransport`, `ReplayTransport`
