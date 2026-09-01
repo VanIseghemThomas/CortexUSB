@@ -27,4 +27,4 @@ jobs:
         run: dotnet test CortexUSB.sln --no-build --configuration Release
 
       - name: Pack (validation only)
-        run: dotnet pack src/CortexUSB/CortexUSB.csproj --no-build --configuration Release --output /tmp/nupkg
+        run: dotnet pack src/CortexUSB.csproj --no-build --configuration Release --output /tmp/nupkg
