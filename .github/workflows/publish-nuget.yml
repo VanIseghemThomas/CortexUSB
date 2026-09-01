@@ -9,7 +9,6 @@ jobs:
     permissions:
       contents: write
       id-token: write
-      workflows: write
 
     steps:
       - uses: actions/checkout@v4
@@ -44,20 +43,7 @@ jobs:
       - name: Push to NuGet.org
         run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
-      - name: Tag commit
-        if: success()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          TAG="v${{ steps.gen-version.outputs.version }}"
-          echo "Tagging commit ${{ steps.gen-version.outputs.short_sha }} as $TAG"
-          if git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
-            echo "Tag $TAG already exists on remote, skipping."
-            exit 0
-          fi
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists locally, skipping creation."
-          else
-            git tag -a "$TAG" -m "Release $TAG (${{ steps.gen-version.outputs.full_version }})"
-          fi
-          git push origin "$TAG"
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.gen-version.version}}
