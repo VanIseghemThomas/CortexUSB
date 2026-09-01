@@ -1,4 +1,3 @@
-using System.Text;
 using Google.Protobuf;
 using CortexProtobufV2;
 

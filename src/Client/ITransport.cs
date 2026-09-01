@@ -1,5 +1,3 @@
-using System;
-
 namespace OpenCortex.CortexUSB.Client
 {
     /// <summary>

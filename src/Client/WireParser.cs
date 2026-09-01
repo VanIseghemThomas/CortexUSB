@@ -1,9 +1,4 @@
-using System;
 using System.IO.Compression;
-using System.IO;
-using System.Threading;
-using System;
-using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 
 namespace OpenCortex.CortexUSB.Client

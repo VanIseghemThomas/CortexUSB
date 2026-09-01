@@ -2436,7 +2436,7 @@ namespace OpenCortex.CortexUSB
             foreach (Chain? chain in preset.Chains)
             {
                 int rowIndex = chain.HasRow ? (int)chain.Row : rowFallback++;
-                var (blocks, splits) = BuildChainBlocks(chain, rowIndex, currentScene, sceneBypasses);
+                (List<Block>? blocks, List<SplitInfo>? splits) = BuildChainBlocks(chain, rowIndex, currentScene, sceneBypasses);
                 ChainIO io = BuildChainIo(chain);
 
                 rows[rowIndex] = new GridRow
@@ -2507,7 +2507,7 @@ namespace OpenCortex.CortexUSB
             // with no local fork point, and must still produce a SplitInfo or
             // the paired row's rejoin never renders.
             List<SplitInfo> splits = new();
-            foreach (var scp in chain.SplitControlPoints)
+            foreach (SplitControlPoints? scp in chain.SplitControlPoints)
             {
                 if (scp.Split < 0 && scp.Mix < 0) continue;
 

@@ -118,7 +118,10 @@ namespace OpenCortex.CortexUSB
             {
                 List<FlatPreset> flat = [];
                 FlattenPresets(library, flat);
-                return flat;
+                if (flat.Count > 0)
+                {
+                    return flat;
+                }
             }
 
             if (_client.IsConnected)

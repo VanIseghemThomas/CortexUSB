@@ -1,6 +1,4 @@
-using System;
 using Microsoft.Extensions.Logging;
-using OpenCortex.CortexUSB;
 
 namespace OpenCortex.CortexUSB.Client
 {

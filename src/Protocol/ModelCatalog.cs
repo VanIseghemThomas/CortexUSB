@@ -1,4 +1,3 @@
-using System.IO;
 using System.Text;
 using System.Xml;
 using OpenCortex.CortexUSB.Models;

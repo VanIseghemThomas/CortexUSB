@@ -1,6 +1,5 @@
 using HidSharp;
 using System.Collections.Concurrent;
-using System.Linq;
 using Microsoft.Extensions.Logging;
 using OpenCortex.CortexUSB.Client;
 
