@@ -69,6 +69,51 @@ namespace OpenCortex.CortexUSB.Models
 
         [JsonPropertyName("sceneColors")]
         public List<uint> SceneColors { get; init; } = [];
+
+        /// <summary>Which grid cells drive which Stomp-mode footswitch. A footswitch may drive several cells.</summary>
+        [JsonPropertyName("stompAssignments")]
+        public List<StompAssignment> StompAssignments { get; init; } = [];
+
+        /// <summary>Per-footswitch label/momentary state (A-H, index 0-7), sparse — a missing index means unlabeled/latching.</summary>
+        [JsonPropertyName("footswitches")]
+        public List<FootswitchInfo> Footswitches { get; init; } = [];
+    }
+
+    /// <summary>
+    /// A grid cell bound to a Stomp-mode footswitch.
+    /// Populated from BinaryPreset.stomp_mode_assignments via Grid (type 1) / RecallPreset (type 15).
+    /// </summary>
+    public record StompAssignment
+    {
+        [JsonPropertyName("row")]
+        public int Row { get; init; }
+
+        [JsonPropertyName("column")]
+        public int Column { get; init; }
+
+        /// <summary>0-7 (A-H).</summary>
+        [JsonPropertyName("footswitch")]
+        public int Footswitch { get; init; }
+    }
+
+    /// <summary>
+    /// Per-preset label and momentary/latching state for one Stomp-mode footswitch (0-7, A-H).
+    /// Populated from BinaryPreset.stomp_labels/single_stomp_labels/stomp_is_momentary.
+    /// </summary>
+    public record FootswitchInfo
+    {
+        [JsonPropertyName("index")]
+        public int Index { get; init; }
+
+        [JsonPropertyName("label")]
+        public string Label { get; init; } = string.Empty;
+
+        /// <summary>Set only when the footswitch drives exactly one block — see BuildStompLabelMessage.</summary>
+        [JsonPropertyName("singleLabel")]
+        public string SingleLabel { get; init; } = string.Empty;
+
+        [JsonPropertyName("momentary")]
+        public bool Momentary { get; init; }
     }
 
     public record GridRow

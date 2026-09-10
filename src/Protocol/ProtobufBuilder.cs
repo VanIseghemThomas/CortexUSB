@@ -397,6 +397,93 @@ namespace OpenCortex.CortexUSB.Protocol
             return new GridMessage { Action = MessageAction.Types.Enum.Update, Preset = preset }.ToByteArray();
         }
 
+        // ─── Footswitch / Stomp-mode assignments ───────────────────────────
+        // Wire shapes verified against pyquadcortex's client.py (set_stomp_assignment,
+        // clear_stomp_assignment, set_stomp_momentary, set_stomp_label), each confirmed
+        // on hardware there. StompModeAssignment's row/column/stomp_index are proto3
+        // fields with NO presence tracking (no `optional` in Preset.proto) — 0 is
+        // indistinguishable from unset on the wire, same as pyquadcortex notes.
+
+        /// <summary>
+        /// Build a Grid message (type 1) clearing any existing Stomp-mode footswitch
+        /// assignment for a grid cell. Format: GridMessage { action=DELETE,
+        /// preset={ stomp_mode_assignments=[{ row, column }] } }.
+        /// A footswitch may drive several cells, so assigning is additive — send this
+        /// first (as the unit's own touchscreen does) or a stale assignment for this
+        /// cell is left in place alongside the new one.
+        /// </summary>
+        public static byte[] BuildClearStompAssignmentMessage(int rowIndex, int columnIndex)
+        {
+            if (rowIndex < 0 || rowIndex > 3) throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index must be 0-3");
+            if (columnIndex < 0 || columnIndex > 7) throw new ArgumentOutOfRangeException(nameof(columnIndex), "Column index must be 0-7");
+
+            BinaryPreset preset = new();
+            preset.StompModeAssignments.Add(new StompModeAssignment { Row = (uint)rowIndex, Column = (uint)columnIndex });
+
+            return new GridMessage { Action = MessageAction.Types.Enum.Delete, Preset = preset }.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a Grid message (type 1) assigning a grid cell to a Stomp-mode footswitch.
+        /// Format: GridMessage { action=UPDATE, preset={ stomp_mode_assignments=[{ row, column,
+        /// stomp_index }] } }. Footswitch index is 0-7 (A-H). Callers should send
+        /// <see cref="BuildClearStompAssignmentMessage"/> first — see its remarks.
+        /// </summary>
+        public static byte[] BuildStompAssignMessage(int rowIndex, int columnIndex, int footswitchIndex)
+        {
+            if (rowIndex < 0 || rowIndex > 3) throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index must be 0-3");
+            if (columnIndex < 0 || columnIndex > 7) throw new ArgumentOutOfRangeException(nameof(columnIndex), "Column index must be 0-7");
+            if (footswitchIndex < 0 || footswitchIndex > 7) throw new ArgumentOutOfRangeException(nameof(footswitchIndex), "Footswitch index must be 0-7 (A-H)");
+
+            BinaryPreset preset = new();
+            preset.StompModeAssignments.Add(new StompModeAssignment
+            {
+                Row = (uint)rowIndex,
+                Column = (uint)columnIndex,
+                StompIndex = (uint)footswitchIndex
+            });
+
+            return new GridMessage { Action = MessageAction.Types.Enum.Update, Preset = preset }.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a Grid message (type 1) setting a footswitch's Latching/Momentary behavior
+        /// for the current preset. Format: GridMessage { action=UPDATE,
+        /// preset={ stomp_is_momentary{footswitch: momentary} } }.
+        /// The device silently ignores this when the footswitch currently drives more than
+        /// one cell — no error, no echo, unchanged on read-back (confirmed on hardware by
+        /// pyquadcortex). Callers should check the footswitch drives exactly one cell first
+        /// if that matters.
+        /// </summary>
+        public static byte[] BuildStompMomentaryMessage(int footswitchIndex, bool momentary)
+        {
+            if (footswitchIndex < 0 || footswitchIndex > 7) throw new ArgumentOutOfRangeException(nameof(footswitchIndex), "Footswitch index must be 0-7 (A-H)");
+
+            BinaryPreset preset = new();
+            preset.StompIsMomentary[(uint)footswitchIndex] = momentary;
+
+            return new GridMessage { Action = MessageAction.Types.Enum.Update, Preset = preset }.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a Grid message (type 1) labeling a footswitch for the current preset.
+        /// Format: GridMessage { action=UPDATE, preset={ stomp_labels{fs: label} } } — or
+        /// single_stomp_labels when <paramref name="single"/>, which the unit uses when the
+        /// footswitch drives exactly one block. The device clears both maps when an
+        /// assignment is removed.
+        /// </summary>
+        public static byte[] BuildStompLabelMessage(int footswitchIndex, string label, bool single)
+        {
+            if (footswitchIndex < 0 || footswitchIndex > 7) throw new ArgumentOutOfRangeException(nameof(footswitchIndex), "Footswitch index must be 0-7 (A-H)");
+            ArgumentNullException.ThrowIfNull(label);
+
+            BinaryPreset preset = new();
+            if (single) preset.SingleStompLabels[(uint)footswitchIndex] = label;
+            else preset.StompLabels[(uint)footswitchIndex] = label;
+
+            return new GridMessage { Action = MessageAction.Types.Enum.Update, Preset = preset }.ToByteArray();
+        }
+
         /// <summary>
         /// Build a File message (type 4) saving the preset currently on the grid ("Save As").
         /// Format: FileMessage { action=CREATE, type=0, folder={ key=<setlist path>, is_factory=false,
@@ -410,15 +497,21 @@ namespace OpenCortex.CortexUSB.Protocol
             if (slotIndex < 0 || slotIndex > 255) throw new ArgumentOutOfRangeException(nameof(slotIndex), "Slot index must be 0-255");
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Preset name is required", nameof(name));
 
-            FileMessage message = new() { Type = 0 };
-            message.Folder.Key = setlistPath;
-            message.Folder.IsFactory = false;
-            message.Folder.Files.Add(new ProductData
+            // Folder/ToFolder are plain nullable singular message fields in the generated
+            // protobuf code (no auto-vivification — confirmed: `private FolderInfo folder_;`
+            // with no initializer, plain get/set). `message.Folder.Key = ...` therefore
+            // NullReferenceExceptions until Folder itself is assigned a real instance first —
+            // build it via object initializer instead of post-construction property chaining.
+            FileMessage message = new()
             {
-                Index = slotIndex,
-                Name = name,
-                Instrument = instrument
-            });
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = setlistPath,
+                    IsFactory = false,
+                    Files = { new ProductData { Index = slotIndex, Name = name, Instrument = instrument } }
+                }
+            };
 
             return message.ToByteArray();
         }
@@ -439,6 +532,148 @@ namespace OpenCortex.CortexUSB.Protocol
                 throw new ArgumentOutOfRangeException(nameof(slot), $"Bank must be 1-32 (a setlist holds 256 slots): {slot}");
             }
             return (bank - 1) * 8 + (s[^1] - 'A');
+        }
+
+        // ─── Preset & Setlist library management ───────────────────────────
+        // Wire shapes verified against pyquadcortex's client.py (create_setlist,
+        // delete_setlist, delete_preset, move_preset — each docstring there cites
+        // a hardware capture), CorOS 4.0.1 / firmware d14e. Root path confirmed
+        // against this codebase's own BuildDirectoryTree ("/media/p4/Presets").
+
+        /// <summary>Device path under which all user setlists live, side by side (not nested under "My Presets").</summary>
+        public const string UserSetlistRoot = "/media/p4/Presets";
+
+        /// <summary>
+        /// Build a File message (type 4) that creates a new user setlist.
+        /// Format: {action=CREATE (default), type=0, folder{key="{UserSetlistRoot}/{name}", name, is_factory=false}}.
+        /// The returned key works anywhere a setlist path does (e.g. BuildSavePresetMessage's setlistPath).
+        /// </summary>
+        public static byte[] BuildCreateSetlistMessage(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Setlist name is required", nameof(name));
+
+            FileMessage message = new()
+            {
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = $"{UserSetlistRoot}/{name}",
+                    Name = name,
+                    IsFactory = false
+                }
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a File message (type 4) that deletes a user setlist and everything in it.
+        /// Format: {action=DELETE, type=0, folder{key="{UserSetlistRoot}/{name}", name}}.
+        /// </summary>
+        public static byte[] BuildDeleteSetlistMessage(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Setlist name is required", nameof(name));
+
+            FileMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Delete,
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = $"{UserSetlistRoot}/{name}",
+                    Name = name
+                }
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a File message (type 4) that deletes a preset from a setlist.
+        /// Format: {action=DELETE, type=0, folder{key=setlistPath, is_factory=false,
+        /// files{key="{setlistPath}/{presetName}.pb"}}} — the preset is addressed by its
+        /// device FILE PATH (name-based, ".pb" extension), NOT by slot index.
+        /// </summary>
+        public static byte[] BuildDeletePresetMessage(string setlistPath, string presetName)
+        {
+            if (string.IsNullOrWhiteSpace(setlistPath)) throw new ArgumentException("Setlist path is required", nameof(setlistPath));
+            if (string.IsNullOrWhiteSpace(presetName)) throw new ArgumentException("Preset name is required", nameof(presetName));
+
+            FileMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Delete,
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = setlistPath,
+                    IsFactory = false,
+                    Files = { new ProductData { Key = $"{setlistPath}/{presetName}.pb" } }
+                }
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a File message (type 4) that moves a preset to a new slot within the
+        /// SAME setlist. Format: {action=MOVE, type=0, folder{key=setlistPath,
+        /// files{key="{setlistPath}/{presetName}.pb"}}, to_folder{key=setlistPath,
+        /// files{index=toPositionIndex}}} — source addressed by FILE PATH, destination
+        /// by linear slot index (0-255; use <see cref="SlotToPosition"/> for names like "28D").
+        /// </summary>
+        public static byte[] BuildMovePresetMessage(string setlistPath, string presetName, int toPositionIndex)
+        {
+            if (string.IsNullOrWhiteSpace(setlistPath)) throw new ArgumentException("Setlist path is required", nameof(setlistPath));
+            if (string.IsNullOrWhiteSpace(presetName)) throw new ArgumentException("Preset name is required", nameof(presetName));
+            if (toPositionIndex < 0 || toPositionIndex > 255) throw new ArgumentOutOfRangeException(nameof(toPositionIndex), "Slot index must be 0-255");
+
+            FileMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Move,
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = setlistPath,
+                    IsFactory = false,
+                    Files = { new ProductData { Key = $"{setlistPath}/{presetName}.pb" } }
+                },
+                ToFolder = new FolderInfo
+                {
+                    Key = setlistPath,
+                    Files = { new ProductData { Index = toPositionIndex } }
+                }
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a File message (type 4) that renames a preset in place.
+        /// <para><b>UNCONFIRMED against hardware.</b> Delete/Move address a preset by its
+        /// file key ("{setlistPath}/{name}.pb") and this extrapolates the same addressing
+        /// under action=UPDATE with a new name — no capture of an actual rename exists in
+        /// pyquadcortex (its own save_current_preset docstring calls out "no rename" as a
+        /// known gap in that library), so this is a best-effort guess pending a real test.</para>
+        /// </summary>
+        public static byte[] BuildRenamePresetMessage(string setlistPath, string oldName, string newName)
+        {
+            if (string.IsNullOrWhiteSpace(setlistPath)) throw new ArgumentException("Setlist path is required", nameof(setlistPath));
+            if (string.IsNullOrWhiteSpace(oldName)) throw new ArgumentException("Current preset name is required", nameof(oldName));
+            if (string.IsNullOrWhiteSpace(newName)) throw new ArgumentException("New preset name is required", nameof(newName));
+
+            FileMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Update,
+                Type = 0,
+                Folder = new FolderInfo
+                {
+                    Key = setlistPath,
+                    IsFactory = false,
+                    Files = { new ProductData { Key = $"{setlistPath}/{oldName}.pb", Name = newName } }
+                }
+            };
+
+            return message.ToByteArray();
         }
 
         // ─── Phase 4: Global EQ / Master Volume / Tuner ────────────────────

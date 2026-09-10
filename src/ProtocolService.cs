@@ -82,7 +82,14 @@ namespace OpenCortex.CortexUSB
         private Dictionary<int, ModelInfo> _modelMap = [];
         private List<GridRow> _grid = [];
         private BinaryPreset? _currentPreset;
-        private readonly List<byte[]> _fileMessages = [];
+        // Keyed by folder path, NOT an append-only log: a later listing for a path
+        // already seen (e.g. after a rename/delete/create touches that folder) must
+        // REPLACE the earlier snapshot here, or RebuildPresetLibrary below would
+        // keep replaying both the stale and fresh snapshots for that path forever —
+        // confirmed live: renaming a preset made BOTH the old and new name show up
+        // simultaneously (both marked active), because BuildDirectoryTree had two
+        // PresetDirectory nodes for the same path to choose between.
+        private readonly Dictionary<string, byte[]> _fileMessages = [];
         private readonly object _fileMessagesLock = new();
         private DateTime _lastLibraryRebuild = DateTime.MinValue;
         private volatile bool _isConnected;
@@ -1434,6 +1441,173 @@ namespace OpenCortex.CortexUSB
         }
 
         /// <summary>
+        /// Assigns a grid cell to drive a Stomp-mode footswitch (0-7, A-H). Reproduces the
+        /// unit's own clear-then-assign two-message sequence (see
+        /// <see cref="ProtobufBuilder.BuildClearStompAssignmentMessage"/>) — a lone UPDATE
+        /// leaves any prior assignment for the cell in place. A footswitch may drive several
+        /// cells; assigning does not displace the footswitch's other cells.
+        /// </summary>
+        public async Task<bool> SetStompAssignmentAsync(int rowIndex, int columnIndex, int footswitchIndex)
+        {
+            if (!_isConnected) return LogNotConnected("set stomp assignment");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Assigning stomp: row={Row}, col={Col} -> footswitch {Fs}", rowIndex, columnIndex, footswitchIndex);
+
+                byte[] clear = ProtobufBuilder.BuildClearStompAssignmentMessage(rowIndex, columnIndex);
+                SendCommand(clear, MessageTypes.Grid);
+                // Best-effort drain of the clear's own echo so it isn't mistaken for the
+                // assign's confirmation below — mirrors pyquadcortex sending both messages
+                // back-to-back without waiting on the first individually.
+                _client.WaitForMessage(MessageTypes.Grid, _ => true, TimeSpan.FromMilliseconds(200));
+
+                byte[] assign = ProtobufBuilder.BuildStompAssignMessage(rowIndex, columnIndex, footswitchIndex);
+                if (!SendCommand(assign, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send stomp-assign message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsStompAssignment(p, rowIndex, columnIndex, footswitchIndex),
+                                     out bool gridSeen, out bool preciseMatch))
+                {
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but stomp assignment [{Row},{Col}]->{Fs} not confirmed", rowIndex, columnIndex, footswitchIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for stomp assignment [{Row},{Col}]", rowIndex, columnIndex);
+                    return false;
+                }
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Stomp assignment [{Row},{Col}]->{Fs} confirmed by device echo", rowIndex, columnIndex, footswitchIndex);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "stomp"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>Unassigns a grid cell from whichever Stomp-mode footswitch it currently drives.</summary>
+        public async Task<bool> ClearStompAssignmentAsync(int rowIndex, int columnIndex)
+        {
+            if (!_isConnected) return LogNotConnected("clear stomp assignment");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Clearing stomp assignment: row={Row}, col={Col}", rowIndex, columnIndex);
+
+                byte[] message = ProtobufBuilder.BuildClearStompAssignmentMessage(rowIndex, columnIndex);
+                if (!SendCommand(message, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send stomp-clear message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsStompCleared(p, rowIndex, columnIndex),
+                                     out bool gridSeen, out _))
+                {
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but stomp clear [{Row},{Col}] not confirmed", rowIndex, columnIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for stomp clear [{Row},{Col}]", rowIndex, columnIndex);
+                    return false;
+                }
+                _logger.LogDebug("[ProtocolService] Stomp clear [{Row},{Col}] confirmed by device echo", rowIndex, columnIndex);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "stomp"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sets a footswitch's Latching/Momentary behavior for the current preset. The device
+        /// silently ignores this when the footswitch drives more than one cell — no error, no
+        /// echo — so this returns false with no Grid echo in that case; check
+        /// <see cref="QuadCortex.ListStompAssignments"/> first if that matters (see
+        /// <see cref="ProtobufBuilder.BuildStompMomentaryMessage"/>).
+        /// </summary>
+        public async Task<bool> SetStompMomentaryAsync(int footswitchIndex, bool momentary)
+        {
+            if (!_isConnected) return LogNotConnected("set stomp momentary");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Setting stomp momentary: footswitch={Fs}, momentary={Momentary}", footswitchIndex, momentary);
+
+                byte[] message = ProtobufBuilder.BuildStompMomentaryMessage(footswitchIndex, momentary);
+                if (!SendCommand(message, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send stomp-momentary message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsStompMomentary(p, footswitchIndex, momentary),
+                                     out bool gridSeen, out bool preciseMatch))
+                {
+                    _logger.LogWarning("[ProtocolService] No Grid echo within 2s for stomp momentary fs={Fs} — likely refused because it drives more than one cell", footswitchIndex);
+                    return false;
+                }
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Stomp momentary fs={Fs}={Momentary} confirmed by device echo", footswitchIndex, momentary);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "stomp"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Labels a footswitch for the current preset. Pass <paramref name="single"/> = true
+        /// when the footswitch drives exactly one block (see <see cref="ProtobufBuilder.BuildStompLabelMessage"/>).
+        /// </summary>
+        public async Task<bool> SetStompLabelAsync(int footswitchIndex, string label, bool single = false)
+        {
+            if (!_isConnected) return LogNotConnected("set stomp label");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogDebug("[ProtocolService] Setting stomp label: footswitch={Fs}, label='{Label}', single={Single}", footswitchIndex, label, single);
+
+                byte[] message = ProtobufBuilder.BuildStompLabelMessage(footswitchIndex, label, single);
+                if (!SendCommand(message, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send stomp-label message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsStompLabel(p, footswitchIndex, label, single),
+                                     out bool gridSeen, out bool preciseMatch))
+                {
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but stomp label fs={Fs} not confirmed", footswitchIndex);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for stomp label fs={Fs}", footswitchIndex);
+                    return false;
+                }
+                if (preciseMatch) _logger.LogDebug("[ProtocolService] Stomp label fs={Fs}='{Label}' confirmed by device echo", footswitchIndex, label);
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "stomp"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
         /// Saves the preset currently on the grid into a setlist slot ("Save As").
         /// <paramref name="slot"/> is a linear index (0-255) or a slot name like "30A".
         /// The device de-duplicates names on collision and truncates to 20 chars, so the
@@ -1485,6 +1659,254 @@ namespace OpenCortex.CortexUSB
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[ProtocolService] Error saving preset");
+                return false;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Deletes a preset from a setlist by name. Best-effort confirmed by a File
+        /// listing echo showing the preset no longer present (up to 5s) — per
+        /// pyquadcortex's own findings, file operations are asynchronous and this
+        /// protocol stalls every host write, so a missing echo does not mean the
+        /// operation failed; re-list (<see cref="ListPresets"/>-equivalent) to
+        /// confirm if in doubt.
+        /// </summary>
+        public async Task<bool> DeletePresetAsync(string setlistPath, string presetName)
+        {
+            if (!_isConnected) return LogNotConnected("delete preset");
+            if (string.IsNullOrWhiteSpace(setlistPath) || string.IsNullOrWhiteSpace(presetName))
+            {
+                _logger.LogWarning("[ProtocolService] setlistPath and presetName are required to delete a preset");
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogInformation("[ProtocolService] Deleting preset '{Name}' from {SetlistPath}...", presetName, setlistPath);
+
+                byte[] message = ProtobufBuilder.BuildDeletePresetMessage(setlistPath, presetName);
+                if (!SendCommand(message, MessageTypes.File))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send delete-preset message");
+                    return false;
+                }
+
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.File,
+                    p => FileListingLacksPreset(p.Payload, setlistPath, presetName),
+                    TimeSpan.FromSeconds(5));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Delete sent but no confirming listing for '{Name}' within 5s — verify on the unit", presetName);
+                }
+                else
+                {
+                    _logger.LogInformation("[ProtocolService] Delete confirmed by device listing ('{Name}' no longer present)", presetName);
+                }
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "preset"));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error deleting preset");
+                return false;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Moves a preset to a new slot within the SAME setlist. <paramref name="toSlot"/>
+        /// is a linear index (0-255) or a slot name like "28D". Best-effort confirmed
+        /// by a File listing echo showing a preset now occupying the target slot.
+        /// </summary>
+        public async Task<bool> MovePresetAsync(string setlistPath, string presetName, string toSlot)
+        {
+            if (!_isConnected) return LogNotConnected("move preset");
+            if (string.IsNullOrWhiteSpace(setlistPath) || string.IsNullOrWhiteSpace(presetName) || string.IsNullOrWhiteSpace(toSlot))
+            {
+                _logger.LogWarning("[ProtocolService] setlistPath, presetName and toSlot are required to move a preset");
+                return false;
+            }
+
+            int toIndex = int.TryParse(toSlot, out int parsed) ? parsed : ProtobufBuilder.SlotToPosition(toSlot);
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogInformation("[ProtocolService] Moving preset '{Name}' in {SetlistPath} to slot {ToIndex}...", presetName, setlistPath, toIndex);
+
+                byte[] message = ProtobufBuilder.BuildMovePresetMessage(setlistPath, presetName, toIndex);
+                if (!SendCommand(message, MessageTypes.File))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send move-preset message");
+                    return false;
+                }
+
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.File,
+                    p => FileListingContainsSlot(p.Payload, setlistPath, toIndex),
+                    TimeSpan.FromSeconds(5));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Move sent but no confirming listing for slot {ToIndex} within 5s — verify on the unit", toIndex);
+                }
+                else
+                {
+                    _logger.LogInformation("[ProtocolService] Move confirmed by device listing (slot {ToIndex})", toIndex);
+                }
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "preset"));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error moving preset");
+                return false;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Renames a preset in place. <b>UNCONFIRMED against hardware</b> — see
+        /// <see cref="ProtobufBuilder.BuildRenamePresetMessage"/> for why. Best-effort
+        /// confirmed by a File listing echo showing the new name present.
+        /// </summary>
+        public async Task<bool> RenamePresetAsync(string setlistPath, string oldName, string newName)
+        {
+            if (!_isConnected) return LogNotConnected("rename preset");
+            if (string.IsNullOrWhiteSpace(setlistPath) || string.IsNullOrWhiteSpace(oldName) || string.IsNullOrWhiteSpace(newName))
+            {
+                _logger.LogWarning("[ProtocolService] setlistPath, oldName and newName are required to rename a preset");
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogInformation("[ProtocolService] Renaming preset '{OldName}' to '{NewName}' in {SetlistPath}...", oldName, newName, setlistPath);
+
+                byte[] message = ProtobufBuilder.BuildRenamePresetMessage(setlistPath, oldName, newName);
+                if (!SendCommand(message, MessageTypes.File))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send rename-preset message");
+                    return false;
+                }
+
+                WirePayload? echo = _client.WaitForMessage(
+                    MessageTypes.File,
+                    p => FileListingContainsName(p.Payload, setlistPath, newName),
+                    TimeSpan.FromSeconds(5));
+
+                if (echo == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Rename sent but no confirming listing for '{NewName}' within 5s — verify on the unit", newName);
+                }
+                else
+                {
+                    _logger.LogInformation("[ProtocolService] Rename confirmed by device listing ('{NewName}' now present)", newName);
+                }
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "preset"));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error renaming preset");
+                return false;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Creates a new user setlist. Returns the setlist's device path (usable
+        /// anywhere a setlistPath is expected, e.g. <see cref="SavePresetAsync"/>).
+        /// Best-effort: the device is asynchronous about file operations, so this
+        /// returns the path immediately without waiting for confirmation — the
+        /// cached preset library picks up the new setlist within ~500ms via the
+        /// normal File-listing pipeline (<c>HandleFileMessage</c>) once the device
+        /// broadcasts it.
+        /// </summary>
+        public async Task<string?> CreateSetlistAsync(string name)
+        {
+            if (!_isConnected) { LogNotConnected("create setlist"); return null; }
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                _logger.LogWarning("[ProtocolService] Setlist name is required");
+                return null;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogInformation("[ProtocolService] Creating setlist '{Name}'...", name);
+
+                byte[] message = ProtobufBuilder.BuildCreateSetlistMessage(name);
+                if (!SendCommand(message, MessageTypes.File))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send create-setlist message");
+                    return null;
+                }
+
+                return $"{ProtobufBuilder.UserSetlistRoot}/{name}";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error creating setlist");
+                return null;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Deletes a user setlist and everything stored in it. Best-effort: see
+        /// <see cref="CreateSetlistAsync"/> for why this doesn't wait for confirmation.
+        /// </summary>
+        public async Task<bool> DeleteSetlistAsync(string name)
+        {
+            if (!_isConnected) return LogNotConnected("delete setlist");
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                _logger.LogWarning("[ProtocolService] Setlist name is required");
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                _logger.LogInformation("[ProtocolService] Deleting setlist '{Name}'...", name);
+
+                byte[] message = ProtobufBuilder.BuildDeleteSetlistMessage(name);
+                if (!SendCommand(message, MessageTypes.File))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send delete-setlist message");
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error deleting setlist");
                 return false;
             }
             finally
@@ -2051,6 +2473,69 @@ namespace OpenCortex.CortexUSB
             return false;
         }
 
+        /// <summary>Whether a Grid echo confirms cell [row][col] assigned to <paramref name="footswitchIndex"/>.</summary>
+        private bool GridEchoConfirmsStompAssignment(byte[] payload, int row, int col, int footswitchIndex)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                if (msg.Action == MessageAction.Types.Enum.Delete) return false;
+                return msg.Preset.StompModeAssignments.Any(a => a.Row == row && a.Column == col && a.StompIndex == footswitchIndex);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (stomp assignment)");
+            }
+            return false;
+        }
+
+        /// <summary>Whether a Grid DELETE echo confirms cell [row][col]'s stomp assignment was cleared.</summary>
+        private bool GridEchoConfirmsStompCleared(byte[] payload, int row, int col)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                if (msg.Action != MessageAction.Types.Enum.Delete) return false;
+                return msg.Preset.StompModeAssignments.Any(a => a.Row == row && a.Column == col);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (stomp clear)");
+            }
+            return false;
+        }
+
+        /// <summary>Whether a Grid echo confirms footswitch <paramref name="footswitchIndex"/>'s momentary flag.</summary>
+        private bool GridEchoConfirmsStompMomentary(byte[] payload, int footswitchIndex, bool momentary)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                return msg.Preset.StompIsMomentary.TryGetValue((uint)footswitchIndex, out bool value) && value == momentary;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (stomp momentary)");
+            }
+            return false;
+        }
+
+        /// <summary>Whether a Grid echo confirms footswitch <paramref name="footswitchIndex"/>'s label.</summary>
+        private bool GridEchoConfirmsStompLabel(byte[] payload, int footswitchIndex, string label, bool single)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                var map = single ? msg.Preset.SingleStompLabels : msg.Preset.StompLabels;
+                return map.TryGetValue((uint)footswitchIndex, out string? value) && value == label;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (stomp label)");
+            }
+            return false;
+        }
+
         /// <summary>
         /// Whether a File message lists a folder for <paramref name="setlistPath"/> containing
         /// a preset at <paramref name="slotIndex"/> (used to confirm a save).
@@ -2063,6 +2548,36 @@ namespace OpenCortex.CortexUSB
                 if (msg.Folder == null) return false;
                 if (!string.Equals(msg.Folder.Key, setlistPath, StringComparison.OrdinalIgnoreCase)) return false;
                 return msg.Folder.Files.Any(f => f.HasIndex && f.Index == slotIndex);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool FileListingLacksPreset(byte[] payload, string setlistPath, string presetName)
+        {
+            try
+            {
+                FileMessage msg = FileMessage.Parser.ParseFrom(payload);
+                if (msg.Folder == null) return false;
+                if (!string.Equals(msg.Folder.Key, setlistPath, StringComparison.OrdinalIgnoreCase)) return false;
+                return !msg.Folder.Files.Any(f => f.HasName && string.Equals(f.Name, presetName, StringComparison.Ordinal));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool FileListingContainsName(byte[] payload, string setlistPath, string presetName)
+        {
+            try
+            {
+                FileMessage msg = FileMessage.Parser.ParseFrom(payload);
+                if (msg.Folder == null) return false;
+                if (!string.Equals(msg.Folder.Key, setlistPath, StringComparison.OrdinalIgnoreCase)) return false;
+                return msg.Folder.Files.Any(f => f.HasName && string.Equals(f.Name, presetName, StringComparison.Ordinal));
             }
             catch
             {
@@ -2355,7 +2870,8 @@ namespace OpenCortex.CortexUSB
 
         private bool HandleGridMessage(WirePayload message)
         {
-            BinaryPreset? gridEcho = ParseGridMessage(message.Payload);
+            GridMessage? full = ParseGridMessageFull(message.Payload);
+            BinaryPreset? gridEcho = full?.Preset;
             if (gridEcho == null) return false;
 
             // A Grid push is a SPARSE echo of only what changed (e.g. one bypass
@@ -2369,11 +2885,24 @@ namespace OpenCortex.CortexUSB
             }
             else
             {
-                MergeGridEcho(_currentPreset, gridEcho);
+                MergeGridEcho(_currentPreset, gridEcho, full!.Action);
             }
 
             _grid = BuildGrid(_currentPreset, _currentState.Scene);
-            _currentState = _currentState with { Grid = _grid, Timestamp = DateTime.UtcNow };
+
+            // Stomp fields (assignments/labels/momentary) aren't part of the visual
+            // grid, but they live on the same cached BinaryPreset — refresh their
+            // projection on PresetDetails whenever a Grid echo could have touched
+            // them, same as _grid is rebuilt above from the merged preset.
+            PresetDetails? details = _currentState.PresetDetails is { } existingDetails
+                ? existingDetails with
+                {
+                    StompAssignments = BuildStompAssignments(_currentPreset),
+                    Footswitches = BuildFootswitches(_currentPreset)
+                }
+                : null;
+
+            _currentState = _currentState with { Grid = _grid, PresetDetails = details ?? _currentState.PresetDetails, Timestamp = DateTime.UtcNow };
             _logger.LogDebug("[ProtocolService] Grid updated");
             return true;
         }
@@ -2384,7 +2913,7 @@ namespace OpenCortex.CortexUSB
         /// collections. Presence-fallback (index-as-position) mirrors the same
         /// convention used by the echo-confirmation predicates.
         /// </summary>
-        private static void MergeGridEcho(BinaryPreset preset, BinaryPreset echo)
+        private static void MergeGridEcho(BinaryPreset preset, BinaryPreset echo, MessageAction.Types.Enum action)
         {
             for (int i = 0; i < echo.Bypass.Count; i++)
             {
@@ -2393,6 +2922,34 @@ namespace OpenCortex.CortexUSB
             for (int i = 0; i < echo.Chains.Count; i++)
             {
                 MergeChain(preset, echo.Chains[i], i);
+            }
+            foreach (StompModeAssignment incoming in echo.StompModeAssignments)
+            {
+                MergeStompAssignment(preset, incoming, action);
+            }
+            foreach (KeyValuePair<uint, string> kv in echo.StompLabels) preset.StompLabels[kv.Key] = kv.Value;
+            foreach (KeyValuePair<uint, string> kv in echo.SingleStompLabels) preset.SingleStompLabels[kv.Key] = kv.Value;
+            foreach (KeyValuePair<uint, bool> kv in echo.StompIsMomentary) preset.StompIsMomentary[kv.Key] = kv.Value;
+        }
+
+        /// <summary>
+        /// Merges one stomp_mode_assignments entry from a Grid echo. Row/column/stomp_index
+        /// have no field-presence tracking (not `optional` in Preset.proto), so a DELETE
+        /// echo's stomp_index is always 0 — not a real value — and cannot be used to
+        /// distinguish "assign to footswitch A" from "clear". The action on the enclosing
+        /// GridMessage is the only reliable signal (mirrors pyquadcortex's own
+        /// clear-then-update two-message sequence).
+        /// </summary>
+        private static void MergeStompAssignment(BinaryPreset preset, StompModeAssignment incoming, MessageAction.Types.Enum action)
+        {
+            List<StompModeAssignment> stale = preset.StompModeAssignments
+                .Where(a => a.Row == incoming.Row && a.Column == incoming.Column)
+                .ToList();
+            foreach (StompModeAssignment s in stale) preset.StompModeAssignments.Remove(s);
+
+            if (action != MessageAction.Types.Enum.Delete)
+            {
+                preset.StompModeAssignments.Add(incoming);
             }
         }
 
@@ -2512,9 +3069,13 @@ namespace OpenCortex.CortexUSB
 
         private bool HandleFileMessage(WirePayload message)
         {
-            lock (_fileMessagesLock)
+            ParsedFolder? folder = ParseFolderInfo(message.Payload);
+            if (folder != null && !string.IsNullOrWhiteSpace(folder.Path))
             {
-                _fileMessages.Add(message.Payload);
+                lock (_fileMessagesLock)
+                {
+                    _fileMessages[folder.Path] = message.Payload;
+                }
             }
 
             // Throttle: rebuild at most once per 500ms to avoid hammering _stateLock
@@ -2605,8 +3166,39 @@ namespace OpenCortex.CortexUSB
                 Created = preset.Date ?? string.Empty,
                 FwVersion = preset.CreatedVersion.FirstOrDefault() ?? string.Empty,
                 Scenes = preset.SceneLabels.ToList(),
-                SceneColors = preset.SceneColors.ToList()
+                SceneColors = preset.SceneColors.ToList(),
+                StompAssignments = BuildStompAssignments(preset),
+                Footswitches = BuildFootswitches(preset)
             };
+        }
+
+        /// <summary>
+        /// Projects BinaryPreset.stomp_mode_assignments into the public model. StompModeAssignment's
+        /// row/column/stomp_index have no field-presence tracking (not `optional` in Preset.proto),
+        /// so 0 is a real value here, not "unset" — matches the wire, per pyquadcortex's own notes.
+        /// </summary>
+        private static List<StompAssignment> BuildStompAssignments(BinaryPreset preset) =>
+            preset.StompModeAssignments.Select(a => new StompAssignment
+            {
+                Row = (int)a.Row,
+                Column = (int)a.Column,
+                Footswitch = (int)a.StompIndex
+            }).ToList();
+
+        /// <summary>
+        /// Projects the three sparse per-footswitch maps (stomp_labels, single_stomp_labels,
+        /// stomp_is_momentary) into one row per footswitch index that appears in any of them.
+        /// </summary>
+        private static List<FootswitchInfo> BuildFootswitches(BinaryPreset preset)
+        {
+            HashSet<uint> indices = [.. preset.StompLabels.Keys, .. preset.SingleStompLabels.Keys, .. preset.StompIsMomentary.Keys];
+            return indices.OrderBy(i => i).Select(i => new FootswitchInfo
+            {
+                Index = (int)i,
+                Label = preset.StompLabels.TryGetValue(i, out string? l) ? l : string.Empty,
+                SingleLabel = preset.SingleStompLabels.TryGetValue(i, out string? sl) ? sl : string.Empty,
+                Momentary = preset.StompIsMomentary.TryGetValue(i, out bool m) && m
+            }).ToList();
         }
 
         private BinaryPreset? ParseRecallPreset(byte[] payload)
@@ -2624,13 +3216,12 @@ namespace OpenCortex.CortexUSB
             }
         }
 
-        private BinaryPreset? ParseGridMessage(byte[] payload)
+        private GridMessage? ParseGridMessageFull(byte[] payload)
         {
             try
             {
                 byte[] data = CompressionUtils.DecompressIfNeeded(payload);
-                GridMessage message = GridMessage.Parser.ParseFrom(data);
-                return message.Preset;
+                return GridMessage.Parser.ParseFrom(data);
             }
             catch (Exception ex)
             {
@@ -3033,7 +3624,7 @@ namespace OpenCortex.CortexUSB
             List<byte[]> fileMessagesSnapshot;
             lock (_fileMessagesLock)
             {
-                fileMessagesSnapshot = [.. _fileMessages];
+                fileMessagesSnapshot = [.. _fileMessages.Values];
             }
 
             _logger.LogDebug("[ProtocolService] Rebuilding preset library from {FileMessageCount} file messages...", fileMessagesSnapshot.Count);

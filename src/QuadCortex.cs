@@ -97,8 +97,72 @@ namespace OpenCortex.CortexUSB
         public Task<bool> SetSplitAsync(int row, int splitColumn, int mixColumn)
             => _service.SetSplitAsync(row, splitColumn, mixColumn);
 
+        /// <summary>Assigns a grid cell to a Stomp-mode footswitch (0-7, A-H). A footswitch may drive several cells.</summary>
+        public Task<bool> SetStompAssignmentAsync(int row, int col, int footswitchIndex)
+            => _service.SetStompAssignmentAsync(row, col, footswitchIndex);
+
+        /// <summary>Unassigns a grid cell from whichever footswitch currently drives it.</summary>
+        public Task<bool> ClearStompAssignmentAsync(int row, int col)
+            => _service.ClearStompAssignmentAsync(row, col);
+
+        /// <summary>
+        /// Sets a footswitch's Latching/Momentary behavior. Silently refused by the device
+        /// (no error, no echo) if the footswitch drives more than one cell — check
+        /// <see cref="ListStompAssignments"/> first if that matters.
+        /// </summary>
+        public Task<bool> SetStompMomentaryAsync(int footswitchIndex, bool momentary)
+            => _service.SetStompMomentaryAsync(footswitchIndex, momentary);
+
+        /// <summary>Labels a footswitch. Pass single=true when it drives exactly one block.</summary>
+        public Task<bool> SetStompLabelAsync(int footswitchIndex, string label, bool single = false)
+            => _service.SetStompLabelAsync(footswitchIndex, label, single);
+
+        /// <summary>Which grid cells drive which Stomp-mode footswitch, for the current preset.</summary>
+        public IReadOnlyList<StompAssignment> ListStompAssignments()
+            => _service.CurrentState.PresetDetails?.StompAssignments ?? [];
+
+        /// <summary>Per-footswitch label/momentary state for the current preset, sparse (A-H, index 0-7).</summary>
+        public IReadOnlyList<FootswitchInfo> ListFootswitches()
+            => _service.CurrentState.PresetDetails?.Footswitches ?? [];
+
         public Task<bool> SavePresetAsync(string setlistPath, string slot, string name, int instrument = 0)
             => _service.SavePresetAsync(setlistPath, slot, name, instrument);
+
+        public Task<bool> DeletePresetAsync(string setlistPath, string presetName)
+            => _service.DeletePresetAsync(setlistPath, presetName);
+
+        public Task<bool> MovePresetAsync(string setlistPath, string presetName, string toSlot)
+            => _service.MovePresetAsync(setlistPath, presetName, toSlot);
+
+        /// <summary>Renames a preset in place. UNCONFIRMED against hardware — see ProtobufBuilder.BuildRenamePresetMessage.</summary>
+        public Task<bool> RenamePresetAsync(string setlistPath, string oldName, string newName)
+            => _service.RenamePresetAsync(setlistPath, oldName, newName);
+
+        /// <summary>Creates a new user setlist. Returns its device path, or null on failure.</summary>
+        public Task<string?> CreateSetlistAsync(string name)
+            => _service.CreateSetlistAsync(name);
+
+        public Task<bool> DeleteSetlistAsync(string name)
+            => _service.DeleteSetlistAsync(name);
+
+        /// <summary>
+        /// Copies a preset into another setlist (or a different slot in the same
+        /// one). Not a device-level operation — the unit has no host-drivable
+        /// copy — this recalls the source preset then saves the grid into the
+        /// destination slot, matching what the unit's own copy/paste turns out to
+        /// do. This CHANGES what is loaded on the unit and leaves the source
+        /// preset on the grid afterwards; it copies the preset's audio state, not
+        /// its metadata (tags aren't carried over — see <see cref="SavePresetAsync"/>).
+        /// <paramref name="toSlot"/> is a linear index (0-255) or a slot name like "28D".
+        /// </summary>
+        public async Task<bool> CopyPresetAsync(string fromSetlistPath, int fromIndex, bool fromIsFactory,
+            string toSetlistPath, string toSlot, string name, int instrument = 0)
+        {
+            bool recalled = await _service.ChangePresetAsync(fromSetlistPath, fromIndex, fromIsFactory);
+            if (!recalled) return false;
+
+            return await _service.SavePresetAsync(toSetlistPath, toSlot, name, instrument);
+        }
 
         public Task<bool> SetGlobalEqBandAsync(int band, float? gain = null, float? frequency = null,
             float? q = null, float? filterType = null, bool? enabled = null)
@@ -147,6 +211,22 @@ namespace OpenCortex.CortexUSB
             }
 
             return [];
+        }
+
+        /// <summary>
+        /// Lists user setlist names under <see cref="ProtobufBuilder.UserSetlistRoot"/>,
+        /// including EMPTY ones. Unlike <see cref="ListPresets"/> (which derives a
+        /// setlist's existence purely from having at least one preset in it — the
+        /// FlatPreset[] shape has no way to represent an empty folder), this reads
+        /// the raw directory tree directly, so a setlist created via
+        /// <see cref="CreateSetlistAsync"/> shows up here even before anything is
+        /// saved into it.
+        /// </summary>
+        public IReadOnlyList<string> ListSetlists()
+        {
+            List<PresetDirectory> library = _service.CurrentState.PresetLibrary;
+            PresetDirectory? presetsRoot = library.FirstOrDefault(d => d.Path == ProtobufBuilder.UserSetlistRoot);
+            return presetsRoot?.Children.Select(c => c.Name).ToList() ?? [];
         }
 
         public IReadOnlyList<FlatPreset> ListPlugins()
