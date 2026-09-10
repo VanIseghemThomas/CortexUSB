@@ -5,6 +5,18 @@
     <PackageId>CortexUSB</PackageId>
     <RootNamespace>OpenCortex.CortexUSB</RootNamespace>
     <Description>USB HID / protocol client library for the Neural DSP Quad Cortex.</Description>
+    <!--
+      Multi-targeted, overriding Directory.Build.props' single net8.0
+      TargetFramework: native consumers (CortexBridge/HidSharp) have no
+      reason to move off net8.0 and must keep building exactly as before,
+      but the WASM consumer (CortexWasm) needs net10.0 — several
+      JSExport/JSImport async-interop hang/deadlock bugs under
+      WasmEnableThreads that we hit on net8.0 are reported fixed there
+      (dotnet/runtime discussion #117698). TargetFramework must be cleared
+      here since TargetFramework and TargetFrameworks cannot both be set.
+    -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,7 +26,18 @@
     </PackageReference>
     <PackageReference Include="HidSharp" Version="2.1.0" />
     <PackageReference Include="Google.Protobuf" Version="3.29.3" />
-    <PackageReference Include="System.Text.Json" Version="10.0.3" />
+    <!--
+      No explicit System.Text.Json reference: net8.0 ships it in-box. A prior
+      pin to 10.0.3 (added in the initial commit, likely just "latest" from
+      an IDE add-package flow) forced a managed assembly two major versions
+      ahead of what the net8.0 browser-wasm runtime pack's native side
+      actually provides — confirmed live that this is what caused a whole
+      cascade of runtime-only failures in the WASM consumer (CortexWasm):
+      NullabilityInfoContext_NotSupported, then MissingMethodException for
+      ArrayBufferWriter<byte>'s and Utf8JsonWriter's constructors once
+      workarounds were tried, each looking like a platform limitation but
+      really just v10 IL calling into v8 native support that doesn't exist.
+    -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.1" />
     <PackageReference Include="Serilog" Version="4.1.0" />
     <PackageReference Include="SonarAnalyzer.CSharp" Version="10.7.0.110445">

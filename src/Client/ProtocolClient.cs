@@ -23,6 +23,9 @@ namespace OpenCortex.CortexUSB.Client
         private byte[]? _aesKey;
         private byte[]? _aesIv;
         private CancellationTokenSource? _cts;
+        // Only set on the plain-Thread fallback path (no IDedicatedThreadFactory
+        // transport) — when a factory is used, it owns the thread's lifetime and
+        // ReaderLoop's own cancellation-token check is what stops it.
         private Thread? _readerThread;
         private readonly ConcurrentDictionary<uint, ConcurrentQueue<WirePayload>> _byType = new();
         public Action<WirePayload>? OnMessageReceived { get; set; }
@@ -48,6 +51,12 @@ namespace OpenCortex.CortexUSB.Client
         private volatile bool _disposed;
 
         public bool IsConnected => _connected && !_disposed;
+
+        // Exposed so ProtocolService can route its own dedicated thread (the
+        // message processor) through the same factory StartBackgroundReader
+        // uses below, instead of calling `new Thread(...).Start()` directly.
+        internal bool HasDedicatedThreadFactory => _transport is IDedicatedThreadFactory;
+        internal IDedicatedThreadFactory? DedicatedFactory => _transport as IDedicatedThreadFactory;
 
         public ProtocolClient(ITransport transport, int idleMsBeforeAction = 1000, Microsoft.Extensions.Logging.ILogger<ProtocolClient>? logger = null, bool fetchModelRepoInHandshake = true)
         {
@@ -135,6 +144,9 @@ namespace OpenCortex.CortexUSB.Client
                 if (w.MessageType != 10) continue;
 
                 PerformHandshakeSteps(w);
+                // Reader is already running below, actively draining the
+                // transport and feeding _byType — WaitForMessage's passive
+                // poll can actually see the ModelRepo response arrive.
                 StartBackgroundReader();
                 WaitForModelRepoIfNeeded();
                 StartKeepAlive();
@@ -190,8 +202,36 @@ namespace OpenCortex.CortexUSB.Client
         private void StartBackgroundReader()
         {
             _cts = new CancellationTokenSource();
-            _readerThread = new Thread(() => ReaderLoop(_cts.Token)) { IsBackground = true };
-            _readerThread.Start();
+            CancellationToken token = _cts.Token;
+
+            // Two WASM-specific problems ruled out Task.Run and a plain
+            // `new Thread(...).Start()` here, in that order — both confirmed
+            // against real hardware:
+            //  1. `new Thread(...).Start()` called from this background worker
+            //     (itself started via Task.Run in ProtocolService.ConnectAsync)
+            //     throws System.ExecutionEngineException:
+            //     mono_thread_platform_create_thread() failed.
+            //  2. Task.Run(ReaderLoop) "fixed" that, but ReaderLoop never
+            //     returns — it permanently occupies the one thread-pool worker
+            //     this WASM runtime appears to have, starving every other
+            //     Task.Run-based continuation in the app forever (ConnectAsync
+            //     never got to log "Connected" or run its post-handshake state
+            //     queries, even though the reader loop itself was alive).
+            // The fix needing both properties at once — a real dedicated thread,
+            // NOT drawn from the pool, created from a context where thread
+            // creation actually succeeds — is IDedicatedThreadFactory: when the
+            // transport implements it (CortexWasm's WebHidTransport does, by
+            // routing the Thread.Start() call through the main thread), use
+            // that; otherwise fall back to a plain dedicated Thread as before.
+            if (_transport is IDedicatedThreadFactory factory)
+            {
+                factory.StartDedicatedThread(() => ReaderLoop(token));
+            }
+            else
+            {
+                _readerThread = new Thread(() => ReaderLoop(token)) { IsBackground = true };
+                _readerThread.Start();
+            }
         }
 
         private void WaitForModelRepoIfNeeded()
@@ -663,14 +703,14 @@ namespace OpenCortex.CortexUSB.Client
 
         /// <summary>
         /// Cleans up after a connection loss — either detected from within the reader
-        /// thread itself (a read stall) or asynchronously from the transport's own
+        /// loop itself (a read stall) or asynchronously from the transport's own
         /// device-watcher thread (an instant physical-unplug notification). Mirrors
         /// <see cref="Disconnect"/> but must NOT join `_readerThread` — that would
-        /// deadlock if called from the reader thread itself, and the other caller
+        /// deadlock if called from the reader loop itself, and the other caller
         /// (an OS device-list callback) has no reason to wait on it either.
         /// Callable from any thread; idempotent against being invoked twice for the
         /// same drop (e.g. an instant unplug notification followed moments later by
-        /// the reader thread's own stall check).
+        /// the reader loop's own stall check).
         /// </summary>
         private void HandleConnectionLost(string reason)
         {

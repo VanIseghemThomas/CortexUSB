@@ -69,8 +69,10 @@ namespace OpenCortex.CortexUSB
         };
         private readonly ProtocolClient _client;
         private readonly ILogger<ProtocolService> _logger;
-        private readonly ConcurrentQueue<WirePayload> _incomingMessages;
         private readonly CancellationTokenSource _cts;
+        // Only used on the dedicated-processor-thread path (native/HidSharp) —
+        // see the constructor's branch on _client.HasDedicatedThreadFactory.
+        private readonly ConcurrentQueue<WirePayload>? _incomingMessages;
         private readonly Thread? _messageProcessorThread;
         private readonly object _stateLock = new();
         private readonly SemaphoreSlim _operationSemaphore = new(1, 1);
@@ -304,18 +306,19 @@ namespace OpenCortex.CortexUSB
         {
             lock (_stateLock)
             {
-                return new DeviceStateSummary(
-                    _currentState.CurrentPreset,
-                    _currentState.PresetDetails,
-                    _currentState.Scene,
-                    _currentState.Mode,
-                    _currentState.Bpm,
-                    _currentState.Grid,
-                    _currentState.Timestamp,
-                    _currentState.GlobalEq,
-                    _currentState.MasterVolume,
-                    _currentState.Tuner
-                );
+                return new DeviceStateSummary
+                {
+                    CurrentPreset = _currentState.CurrentPreset,
+                    PresetDetails = _currentState.PresetDetails,
+                    Scene = _currentState.Scene,
+                    Mode = _currentState.Mode,
+                    Bpm = _currentState.Bpm,
+                    Grid = _currentState.Grid,
+                    Timestamp = _currentState.Timestamp,
+                    GlobalEq = _currentState.GlobalEq,
+                    MasterVolume = _currentState.MasterVolume,
+                    Tuner = _currentState.Tuner
+                };
             }
         }
 
@@ -383,21 +386,50 @@ namespace OpenCortex.CortexUSB
         {
             _logger = logger ?? new SimpleConsoleLogger<ProtocolService>();
             _client = client ?? new ProtocolClient(new UsbHidTransport());
-            _incomingMessages = new ConcurrentQueue<WirePayload>();
             _cts = new CancellationTokenSource();
             _currentState = new DeviceState();
 
-            // Bridge ProtocolClient messages into the ProtocolService processing pipeline
-            _client.OnMessageReceived += msg => _incomingMessages.Enqueue(msg);
-            _client.ConnectionLost += HandleClientConnectionLost;
-
-            // Start background message processor
-            _messageProcessorThread = new Thread(MessageProcessorLoop)
+            // This constructor runs synchronously on the WASM main/UI thread
+            // (triggered by Interop.Connect's JSExport call chain, before any
+            // await yields control back to JS) — confirmed live that creating
+            // ANY new dedicated thread here deadlocks the whole app. A plain
+            // `new Thread(...).Start()` needs the browser event loop to spin
+            // up a new Worker, but the main thread is synchronously blocked
+            // inside Start()'s handshake and can't yield back to that event
+            // loop until the JSExport call itself returns. Routing through
+            // IDedicatedThreadFactory doesn't help either: that queue is only
+            // drained by PumpOutboundQueue, itself a JSExport invoked from a
+            // JS setInterval — which also can't run while the main thread's
+            // call stack is still inside this synchronous constructor.
+            // StartBackgroundReader avoids all this because it's invoked from
+            // a background Task.Run worker (inside ConnectAsync), not
+            // synchronously from the main thread — there's no safe way to
+            // start a dedicated thread from here, so don't: process each
+            // message inline instead, on whatever thread ProtocolClient's
+            // reader loop calls OnMessageReceived from.
+            if (_client.HasDedicatedThreadFactory)
             {
-                Name = "ProtocolServiceProcessor",
-                IsBackground = true
-            };
-            _messageProcessorThread.Start();
+                _client.OnMessageReceived += msg =>
+                {
+                    try { ProcessIncomingMessage(msg); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "[ProtocolService] Error processing message"); }
+                };
+            }
+            else
+            {
+                // Bridge ProtocolClient messages into the ProtocolService processing pipeline
+                _incomingMessages = new ConcurrentQueue<WirePayload>();
+                _client.OnMessageReceived += msg => _incomingMessages.Enqueue(msg);
+
+                // Start background message processor
+                _messageProcessorThread = new Thread(MessageProcessorLoop)
+                {
+                    Name = "ProtocolServiceProcessor",
+                    IsBackground = true
+                };
+                _messageProcessorThread.Start();
+            }
+            _client.ConnectionLost += HandleClientConnectionLost;
 
             // Initialize polling timer (but don't start it until connected)
             _statePollingTimer = new Timer(PollHardwareState, null, Timeout.Infinite, Timeout.Infinite);
@@ -480,7 +512,7 @@ namespace OpenCortex.CortexUSB
                 _suppressStateEvents = true;
 
                 // Perform handshake on background thread
-                bool connected = await Task.Run(() => _client.Connect(actualTimeout), _cts.Token);
+                bool connected = await Task.Run(() => _client.Connect(actualTimeout), _cts.Token).ConfigureAwait(false);
 
                 if (!connected)
                 {
@@ -561,7 +593,10 @@ namespace OpenCortex.CortexUSB
                         WirePayload? response = _client.WaitForMessage(messageType, responseTimeout ?? TimeSpan.FromSeconds(2));
                         if (response != null)
                         {
-                            _incomingMessages.Enqueue(response);
+                            // WASM has no dedicated processor thread to hand this off to
+                            // (see the constructor) — process it inline right here instead.
+                            if (_client.HasDedicatedThreadFactory) ProcessIncomingMessage(response);
+                            else _incomingMessages!.Enqueue(response);
                             _logger.LogDebug("[ProtocolService] Queried {FieldName}: received {ByteCount} bytes", fieldName, response.Payload.Length);
                         }
                         else
@@ -2037,7 +2072,8 @@ namespace OpenCortex.CortexUSB
 
         /// <summary>
         /// Background thread that processes incoming messages from the protocol handler.
-        /// Updates state cache and fires events.
+        /// Updates state cache and fires events. Native/HidSharp path only — see the
+        /// constructor's branch on _client.HasDedicatedThreadFactory.
         /// </summary>
         private void MessageProcessorLoop()
         {
@@ -2049,7 +2085,7 @@ namespace OpenCortex.CortexUSB
             {
                 try
                 {
-                    if (_incomingMessages.TryDequeue(out WirePayload? message))
+                    if (_incomingMessages!.TryDequeue(out WirePayload? message))
                     {
                         // Count message types to see patterns
                         messageCounters[message.MessageType] = messageCounters.GetValueOrDefault(message.MessageType, 0) + 1;

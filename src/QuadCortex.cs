@@ -39,7 +39,11 @@ namespace OpenCortex.CortexUSB
 
         public async Task<bool> ConnectAsync(TimeSpan? timeout = null)
         {
-            return await _service.ConnectAsync(timeout);
+            // ConfigureAwait(false): see ProtocolService.ConnectAsync's comment on
+            // its own dedicated-thread await — this call is entered from the main
+            // thread too (via Interop.Connect) and awaits that same not-yet-complete
+            // task, so it needs the same fix to avoid the dead main-thread marshal.
+            return await _service.ConnectAsync(timeout).ConfigureAwait(false);
         }
 
         public DeviceStateSummary GetStateSummary() => _service.GetStateSummary();
@@ -139,7 +143,7 @@ namespace OpenCortex.CortexUSB
             if (_client.IsConnected)
             {
                 IList<ProductData> presets = _client.GetLoadedPresets(TimeSpan.FromSeconds(5));
-                return presets.Select(p => new FlatPreset(p.Name ?? "", p.Index, "", "", "")).ToList();
+                return presets.Select(p => new FlatPreset { Name = p.Name ?? "", Index = p.Index }).ToList();
             }
 
             return [];
@@ -156,7 +160,7 @@ namespace OpenCortex.CortexUSB
                 {
                     foreach (PresetEntry entry in dir.Presets)
                     {
-                        plugins.Add(new FlatPreset(entry.Name, entry.Index, entry.Path, entry.Author, dir.Path));
+                        plugins.Add(new FlatPreset { Name = entry.Name, Index = entry.Index, Path = entry.Path, Author = entry.Author, SetlistPath = dir.Path });
                     }
                 }
                 plugins.AddRange(FindPluginsRecursive(dir.Children));
@@ -256,7 +260,7 @@ namespace OpenCortex.CortexUSB
             {
                 foreach (PresetEntry entry in dir.Presets)
                 {
-                    result.Add(new FlatPreset(entry.Name, entry.Index, entry.Path, entry.Author, dir.Path));
+                    result.Add(new FlatPreset { Name = entry.Name, Index = entry.Index, Path = entry.Path, Author = entry.Author, SetlistPath = dir.Path });
                 }
                 FlattenPresets(dir.Children, result);
             }
@@ -271,7 +275,7 @@ namespace OpenCortex.CortexUSB
                 {
                     foreach (PresetEntry entry in dir.Presets)
                     {
-                        result.Add(new FlatPreset(entry.Name, entry.Index, entry.Path, entry.Author, dir.Path));
+                        result.Add(new FlatPreset { Name = entry.Name, Index = entry.Index, Path = entry.Path, Author = entry.Author, SetlistPath = dir.Path });
                     }
                 }
                 result.AddRange(FindPluginsRecursive(dir.Children));
