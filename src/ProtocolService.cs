@@ -324,7 +324,9 @@ namespace OpenCortex.CortexUSB
                     Timestamp = _currentState.Timestamp,
                     GlobalEq = _currentState.GlobalEq,
                     MasterVolume = _currentState.MasterVolume,
-                    Tuner = _currentState.Tuner
+                    Tuner = _currentState.Tuner,
+                    IoMeter = _currentState.IoMeter,
+                    CpuLoad = _currentState.CpuLoad
                 };
             }
         }
@@ -1242,6 +1244,242 @@ namespace OpenCortex.CortexUSB
         }
 
         /// <summary>
+        /// Assigns or unassigns a block parameter to Scenes — the manual's "SCENE
+        /// ASSIGNMENTS" feature ("tap and hold a parameter to assign or unassign
+        /// it to Scenes. Once assigned, the parameter's value will be stored
+        /// independently for each Scene").
+        ///
+        /// UNVERIFIED against hardware - see <see cref="ProtobufBuilder.BuildGridParamSceneValuesMessage"/>
+        /// for why. Assigning seeds all 8 scenes with the parameter's current
+        /// (pre-assignment) value, so the sound doesn't change the instant this
+        /// lands; unassigning collapses back to whatever the currently-active
+        /// scene's value was.
+        /// </summary>
+        public async Task<bool> SetBlockParameterSceneAssignedAsync(int rowIndex, int columnIndex, int paramIndex, bool assign)
+        {
+            if (!_isConnected) return LogNotConnected("assign parameter to scenes");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                BlockParam? param;
+                lock (_stateLock)
+                {
+                    param = _grid.ElementAtOrDefault(rowIndex)?.Blocks.FirstOrDefault(b => b.SlotIndex == columnIndex)?.Params.FirstOrDefault(p => p.Index == paramIndex);
+                }
+                if (param == null)
+                {
+                    _logger.LogWarning("[ProtocolService] Cannot find param [{Row},{Col}]{Param} to change scene assignment", rowIndex, columnIndex, paramIndex);
+                    return false;
+                }
+
+                float[] sceneValues = assign
+                    ? Enumerable.Repeat(param.Value, 8).ToArray()
+                    : [param.Value];
+
+                byte[] message = ProtobufBuilder.BuildGridParamSceneValuesMessage(rowIndex, columnIndex, paramIndex, sceneValues, assign);
+                if (!SendCommand(message, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send parameter scene-assignment message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsParamSceneAssigned(p, rowIndex, columnIndex, paramIndex, assign),
+                                     out bool gridSeen, out bool preciseMatch))
+                {
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but param [{Row},{Col}]{Param} scene-assignment={Assign} not matched — write may not have taken", rowIndex, columnIndex, paramIndex, assign);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for param [{Row},{Col}]{Param} scene-assignment — write likely refused", rowIndex, columnIndex, paramIndex);
+                    return false;
+                }
+                if (preciseMatch)
+                {
+                    _logger.LogDebug("[ProtocolService] Param [{Row},{Col}]{Param} scene-assignment={Assign} confirmed by device echo", rowIndex, columnIndex, paramIndex, assign);
+                }
+
+                List<float> updatedSceneValues = assign ? [.. sceneValues] : [];
+                lock (_stateLock)
+                {
+                    if (_grid.Count > rowIndex)
+                    {
+                        GridRow row = _grid[rowIndex];
+                        List<Block> updatedBlocks = row.Blocks.Select(block =>
+                        {
+                            if (block.SlotIndex == columnIndex)
+                            {
+                                List<BlockParam> updatedParams = block.Params.Select(p =>
+                                    p.Index == paramIndex
+                                        ? p with { SceneAssigned = assign, SceneValues = updatedSceneValues }
+                                        : p
+                                ).ToList();
+                                return block with { Params = updatedParams };
+                            }
+                            return block;
+                        }).ToList();
+
+                        _grid = _grid.Select((r, i) => i == rowIndex ? r with { Blocks = updatedBlocks } : r).ToList();
+                        _currentState = _currentState with { Grid = _grid, Timestamp = DateTime.UtcNow };
+                    }
+                }
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sets one Scene's value for a parameter that's already Scene-assigned
+        /// (see <see cref="SetBlockParameterSceneAssignedAsync"/> - call that with
+        /// <c>assign: true</c> first if the parameter isn't scene-assigned yet).
+        ///
+        /// UNVERIFIED against hardware. Always resends every other scene's
+        /// already-known value alongside the one being changed (never just the
+        /// changed slot on its own) — the deliberate defense against the array-
+        /// clobber risk described on <see cref="ProtobufBuilder.BuildGridParamSceneValuesMessage"/>.
+        /// </summary>
+        public async Task<bool> SetBlockParameterSceneValueAsync(int rowIndex, int columnIndex, int paramIndex, int sceneIndex, float value)
+        {
+            if (!_isConnected) return LogNotConnected("set scene-specific parameter value");
+            if (sceneIndex < 0 || sceneIndex > 7)
+            {
+                _logger.LogWarning("[ProtocolService] Scene index must be 0-7, got {SceneIndex}", sceneIndex);
+                return false;
+            }
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                BlockParam? param;
+                lock (_stateLock)
+                {
+                    param = _grid.ElementAtOrDefault(rowIndex)?.Blocks.FirstOrDefault(b => b.SlotIndex == columnIndex)?.Params.FirstOrDefault(p => p.Index == paramIndex);
+                }
+                if (param == null || !param.SceneAssigned || param.SceneValues.Count != 8)
+                {
+                    _logger.LogWarning("[ProtocolService] Param [{Row},{Col}]{Param} is not scene-assigned — call SetBlockParameterSceneAssignedAsync(true) first", rowIndex, columnIndex, paramIndex);
+                    return false;
+                }
+
+                float[] sceneValues = [.. param.SceneValues];
+                sceneValues[sceneIndex] = value;
+
+                byte[] message = ProtobufBuilder.BuildGridParamSceneValuesMessage(rowIndex, columnIndex, paramIndex, sceneValues, assignToScenes: true);
+                if (!SendCommand(message, MessageTypes.Grid))
+                {
+                    _logger.LogWarning("[ProtocolService] Failed to send scene-specific parameter message");
+                    return false;
+                }
+
+                if (!WaitForGridEcho(p => GridEchoConfirmsParamAtIndex(p, rowIndex, columnIndex, paramIndex, sceneIndex, value),
+                                     out bool gridSeen, out bool preciseMatch))
+                {
+                    if (gridSeen)
+                        _logger.LogWarning("[ProtocolService] Grid echo seen but param [{Row},{Col}]{Param} scene {SceneIndex}={Value} not matched — write may not have taken", rowIndex, columnIndex, paramIndex, sceneIndex, value);
+                    else
+                        _logger.LogWarning("[ProtocolService] No Grid echo within 2s for param [{Row},{Col}]{Param} scene {SceneIndex} — write likely refused", rowIndex, columnIndex, paramIndex, sceneIndex);
+                    return false;
+                }
+                if (preciseMatch)
+                {
+                    _logger.LogDebug("[ProtocolService] Param [{Row},{Col}]{Param} scene {SceneIndex}={Value} confirmed by device echo", rowIndex, columnIndex, paramIndex, sceneIndex, value);
+                }
+
+                lock (_stateLock)
+                {
+                    if (_grid.Count > rowIndex)
+                    {
+                        GridRow row = _grid[rowIndex];
+                        List<Block> updatedBlocks = row.Blocks.Select(block =>
+                        {
+                            if (block.SlotIndex == columnIndex)
+                            {
+                                List<BlockParam> updatedParams = block.Params.Select(p =>
+                                {
+                                    if (p.Index != paramIndex) return p;
+                                    List<float> updatedValues = [.. p.SceneValues];
+                                    updatedValues[sceneIndex] = value;
+                                    bool isCurrentScene = sceneIndex == _currentState.Scene;
+                                    return p with { SceneValues = updatedValues, Value = isCurrentScene ? value : p.Value };
+                                }).ToList();
+                                return block with { Params = updatedParams };
+                            }
+                            return block;
+                        }).ToList();
+
+                        _grid = _grid.Select((r, i) => i == rowIndex ? r with { Blocks = updatedBlocks } : r).ToList();
+                        _currentState = _currentState with { Grid = _grid, Timestamp = DateTime.UtcNow };
+                    }
+                }
+
+                FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Fire-and-forget parameter write for continuous drag/streaming
+        /// interactions — no semaphore, no echo-wait, same "fire-and-forget
+        /// controls" category as <see cref="SetIoMeterSubscribed"/>/
+        /// <see cref="SetTunerMeterEnabled"/>/etc. elsewhere in this file.
+        ///
+        /// The confirmed <see cref="SetBlockParameterAsync"/> is semaphore-
+        /// serialized with an up-to-2s device-echo wait per call — calling it
+        /// on every drag tick queues writes up faster than they can be
+        /// confirmed, so intermediate values arrive later and later,
+        /// producing a laggy "catching up" effect after the drag ends
+        /// (confirmed via user report while testing this). This method skips
+        /// confirmation entirely so each tick is cheap and immediate.
+        ///
+        /// Callers MUST still send one confirmed <see cref="SetBlockParameterAsync"/>
+        /// (or <see cref="SetBlockParameterSceneValueAsync"/>) once the
+        /// interaction ends — this method never confirms anything, so a
+        /// refused/lost write here is silently dropped by design.
+        /// </summary>
+        public bool StreamBlockParameter(int rowIndex, int columnIndex, int paramIndex, float value)
+        {
+            if (!_isConnected) return LogNotConnected("stream block parameter");
+            return SendCommand(ProtobufBuilder.BuildGridParamMessage(rowIndex, columnIndex, paramIndex, value), MessageTypes.Grid);
+        }
+
+        /// <summary>
+        /// Fire-and-forget equivalent of <see cref="SetBlockParameterSceneValueAsync"/>
+        /// for streaming while dragging an already Scene-assigned parameter —
+        /// see <see cref="StreamBlockParameter"/> for why this exists. Still
+        /// defends against the array-clobber risk documented on
+        /// <see cref="ProtobufBuilder.BuildGridParamSceneValuesMessage"/>:
+        /// always resends every other already-known scene value, never just
+        /// the one changing. Requires the parameter to already be Scene-
+        /// assigned (silently returns false otherwise, same as the confirmed
+        /// version) — assigning itself only ever happens via the confirmed
+        /// <see cref="SetBlockParameterSceneAssignedAsync"/>.
+        /// </summary>
+        public bool StreamBlockParameterSceneValue(int rowIndex, int columnIndex, int paramIndex, int sceneIndex, float value)
+        {
+            if (!_isConnected) return LogNotConnected("stream scene parameter value");
+            if (sceneIndex < 0 || sceneIndex > 7) return false;
+
+            BlockParam? param;
+            lock (_stateLock)
+            {
+                param = _grid.ElementAtOrDefault(rowIndex)?.Blocks.FirstOrDefault(b => b.SlotIndex == columnIndex)?.Params.FirstOrDefault(p => p.Index == paramIndex);
+            }
+            if (param == null || !param.SceneAssigned || param.SceneValues.Count != 8) return false;
+
+            float[] sceneValues = [.. param.SceneValues];
+            sceneValues[sceneIndex] = value;
+            return SendCommand(ProtobufBuilder.BuildGridParamSceneValuesMessage(rowIndex, columnIndex, paramIndex, sceneValues, assignToScenes: true), MessageTypes.Grid);
+        }
+
+        /// <summary>
         /// Places or replaces a block in a grid cell. Placement can be refused for DSP
         /// capacity with no error — verify by Grid echo (a refused block produces no echo).
         /// </summary>
@@ -1319,6 +1557,136 @@ namespace OpenCortex.CortexUSB
             {
                 _operationSemaphore.Release();
             }
+        }
+
+        /// <summary>
+        /// Moves the block at [fromRow,fromCol] to [toRow,toCol]. Sent on
+        /// GridMove (type 12).
+        ///
+        /// FIELD-CAPTURED, not just unconfirmed: waiting for a Grid (type 1)
+        /// echo here was a dead end, not just slow. A live hardware capture
+        /// during this exact call caught the "Grid echo" our wait picked up —
+        /// it decodes to four Chain entries (rows 0-3) each carrying ONLY an
+        /// input_control Model (field 13), nothing in models (field 5) at all.
+        /// That is the device continuously streaming its live input/gain-stage
+        /// meter (see pyquadcortex's GAIN_REDUCTION_PARAM docs) over the SAME
+        /// Grid message type used for real layout changes — ambient telemetry,
+        /// not a reply to anything we sent. There is no dedicated echo for a
+        /// GridMove write to wait for. pyquadcortex's own move_block() doesn't
+        /// wait for one either — it sends and trusts it. This does the same:
+        /// fire-and-forget, then optimistically update the cached grid state
+        /// ourselves so the UI reflects the requested change immediately. If
+        /// the write was actually refused, this cache will disagree with the
+        /// device until the next full resync (scene switch, preset reload) —
+        /// there is currently no better signal available to detect that.
+        ///
+        /// CONFIRMED ON HARDWARE, TWICE: there is no way to atomically swap two
+        /// occupied cells with a single wire message. A plain move onto an
+        /// occupied destination overwrites/destroys it. Sending BOTH directions
+        /// as two elements of one GridMoveMessage.move list (the obvious next
+        /// guess) does the exact same destructive overwrite — the device does
+        /// not apply that list as a swap against the original grid. So a real
+        /// swap is built here out of the one primitive that IS confirmed to
+        /// work: three plain moves staged through a genuinely empty cell.
+        /// That's only branch-free when source and destination share a row (a
+        /// cross-row move is confirmed to create a parallel path/branch as a
+        /// side effect — see BuildGridMoveMessage), so a cross-row swap is
+        /// refused rather than silently introduce a routing change nobody
+        /// asked for, and a same-row swap is refused too if that row has no
+        /// empty cell to stage through.
+        /// </summary>
+        public async Task<bool> MoveBlockAsync(int fromRow, int fromCol, int toRow, int toCol)
+        {
+            if (!_isConnected) return LogNotConnected("move block");
+
+            await _operationSemaphore.WaitAsync(_cts.Token);
+            try
+            {
+                if (_currentPreset == null)
+                {
+                    _logger.LogWarning("[ProtocolService] No cached preset - cannot move block");
+                    return false;
+                }
+                if (GetCachedModelHash(fromRow, fromCol) is null or 0)
+                {
+                    _logger.LogWarning("[ProtocolService] No block cached at [{Row},{Col}] to move", fromRow, fromCol);
+                    return false;
+                }
+
+                bool destOccupied = GetCachedModelHash(toRow, toCol) is not null and not 0;
+                if (!destOccupied)
+                {
+                    _logger.LogDebug("[ProtocolService] Moving block: [{FromRow},{FromCol}] -> [{ToRow},{ToCol}]", fromRow, fromCol, toRow, toCol);
+                    SendRawMove(fromRow, fromCol, toRow, toCol);
+                    return true;
+                }
+
+                if (fromRow != toRow)
+                {
+                    _logger.LogWarning(
+                        "[ProtocolService] Refusing swap [{FromRow},{FromCol}]<->[{ToRow},{ToCol}]: destination occupied and rows differ - staging through a cross-row hop would create a branch as a side effect, so this can't be done safely. Clear the destination first if you want to relocate there.",
+                        fromRow, fromCol, toRow, toCol);
+                    return false;
+                }
+
+                int? scratchCol = FindEmptyColumnInRow(fromRow, fromCol, toCol);
+                if (scratchCol == null)
+                {
+                    _logger.LogWarning(
+                        "[ProtocolService] Refusing swap [{FromRow},{FromCol}]<->[{ToRow},{ToCol}]: row {Row} has no empty cell to stage the swap through",
+                        fromRow, fromCol, toRow, toCol, fromRow);
+                    return false;
+                }
+
+                _logger.LogDebug("[ProtocolService] Swapping [{FromRow},{FromCol}]<->[{ToRow},{ToCol}] via scratch column {Scratch}", fromRow, fromCol, toRow, toCol, scratchCol);
+                SendRawMove(fromRow: fromRow, fromCol: fromCol, toRow: fromRow, toCol: scratchCol.Value);
+                await Task.Delay(150, _cts.Token);
+                SendRawMove(fromRow: toRow, fromCol: toCol, toRow: fromRow, toCol: fromCol);
+                await Task.Delay(150, _cts.Token);
+                SendRawMove(fromRow: fromRow, fromCol: scratchCol.Value, toRow: toRow, toCol: toCol);
+                return true;
+            }
+            finally
+            {
+                _operationSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Sends one GridMove write and immediately applies it to the cached
+        /// grid state — see <see cref="MoveBlockAsync"/> for why there is
+        /// nothing to wait for. Shared by a plain move and each leg of a
+        /// scratch-cell swap.
+        /// </summary>
+        private void SendRawMove(int fromRow, int fromCol, int toRow, int toCol)
+        {
+            byte[] message = ProtobufBuilder.BuildGridMoveMessage(fromRow, fromCol, toRow, toCol);
+            if (!SendCommand(message, MessageTypes.GridMove))
+            {
+                _logger.LogWarning("[ProtocolService] Failed to send grid move message [{FromRow},{FromCol}]->[{ToRow},{ToCol}]", fromRow, fromCol, toRow, toCol);
+                return;
+            }
+
+            Model? model = ExtractModelAt(fromRow, fromCol);
+            if (model != null) PlaceModelAt(toRow, toCol, model);
+
+            _grid = BuildGrid(_currentPreset!, _currentState.Scene);
+            FireStateChanged(StateUpdate.FromClient(_currentState, "grid"));
+        }
+
+        /// <summary>
+        /// The first column in <paramref name="row"/> (other than the two given)
+        /// with no cached block, or null if the row is full. Used to stage a
+        /// same-row swap through a real empty cell — see MoveBlockAsync.
+        /// </summary>
+        private int? FindEmptyColumnInRow(int row, int excludeCol1, int excludeCol2)
+        {
+            for (int col = 0; col < 8; col++)
+            {
+                if (col == excludeCol1 || col == excludeCol2) continue;
+                if (GetCachedModelHash(row, col) is null or 0) return col;
+            }
+            return null;
         }
 
         /// <summary>
@@ -1938,6 +2306,58 @@ namespace OpenCortex.CortexUSB
         }
 
         /// <summary>
+        /// Subscribes (or unsubscribes) to live I/O meter updates.
+        ///
+        /// CONFIRMED via a real USB capture of the official Cortex Control app
+        /// (both a live "playing with metering" session and an older session
+        /// that separately toggled it): a plain Read does nothing (already
+        /// confirmed the hard way on this project's own hardware). What the
+        /// real app actually sends is IOMeterMessage{action=Create, request_id}
+        /// to start the stream and IOMeter{action=Delete, request_id} to stop
+        /// it - "Create" only shows up on the wire as the ABSENCE of an action
+        /// byte, since MessageAction has no `optional` keyword and Create is
+        /// its zero value. Do NOT send ProductionAutomationMode as an attempted
+        /// fix for this - separately confirmed both disruptive (drops the
+        /// WebHID connection) and irrelevant (the official app's own binary has
+        /// no Sender/Receiver class for it at all).
+        /// </summary>
+        public bool SetIoMeterSubscribed(bool subscribe)
+        {
+            if (!_isConnected) return LogNotConnected("subscribe IO meter");
+
+            return SendCommand(ProtobufBuilder.BuildMeterSubscribeMessage(subscribe), MessageTypes.IOMeter);
+        }
+
+        /// <summary>
+        /// Subscribes (or unsubscribes) to the desktop app's "CPU Monitor" feed.
+        /// Same confirmed Create/Delete pattern as <see cref="SetIoMeterSubscribed"/> -
+        /// see that method's doc comment for how this was established.
+        /// </summary>
+        public bool SetCpuLoadSubscribed(bool subscribe)
+        {
+            if (!_isConnected) return LogNotConnected("subscribe CPU load");
+
+            return SendCommand(ProtobufBuilder.BuildMeterSubscribeMessage(subscribe), MessageTypes.CPULoad);
+        }
+
+        /// <summary>
+        /// Subscribes (or unsubscribes) one grid cell's live meter via
+        /// GridModelMeter (type 37) - confirmed real via the official app's own
+        /// binary (see MessageTypes.GridModelMeter), but the exact subscribe
+        /// shape and what, if anything, streams afterward (an echo on this same
+        /// type, or IOMeter/CPULoad starting to move as a side effect) are both
+        /// unconfirmed. See HandleGridModelMeterMessage for the loud diagnostic
+        /// logging on whatever comes back.
+        /// </summary>
+        public bool SubscribeGridModelMeter(int row, int column, int action)
+        {
+            if (!_isConnected) return LogNotConnected("subscribe grid model meter");
+
+            _logger.LogInformation("[ProtocolService] GridModelMeter subscribe: row={Row}, col={Col}, action={Action}", row, column, (MessageAction.Types.Enum)action);
+            return SendCommand(ProtobufBuilder.BuildGridModelMeterSubscribeMessage(row, column, action), MessageTypes.GridModelMeter);
+        }
+
+        /// <summary>
         /// Sets one or more controls on a Global EQ band (1-5). Only the given
         /// controls are written (sparse writes, matching the device's own model).
         /// </summary>
@@ -2002,6 +2422,52 @@ namespace OpenCortex.CortexUSB
             {
                 _operationSemaphore.Release();
             }
+        }
+
+        /// <summary>
+        /// Fire-and-forget equivalent of <see cref="SetGlobalEqBandAsync"/> for
+        /// continuous drag/streaming interactions — same "catching up" problem
+        /// and same fix as <see cref="StreamBlockParameter"/>: the confirmed
+        /// path is semaphore-serialized with an up-to-2s device-echo wait per
+        /// control, so calling it on every drag tick queues writes up faster
+        /// than they can be confirmed. This skips the semaphore and the echo
+        /// wait entirely — each tick is just an immediate wire send.
+        ///
+        /// Callers MUST still send one confirmed <see cref="SetGlobalEqBandAsync"/>
+        /// once the interaction ends — this method never confirms anything, so
+        /// a refused/lost write here is silently dropped by design.
+        /// </summary>
+        public bool StreamGlobalEqBand(int band, float? gain = null, float? frequency = null,
+            float? q = null, float? filterType = null, bool? enabled = null)
+        {
+            if (!_isConnected) return LogNotConnected("stream global EQ band");
+            if (band < 1 || band > ProtobufBuilder.GlobalEqBands)
+            {
+                _logger.LogWarning("[ProtocolService] Invalid EQ band {Band} (must be 1-{MaxBand})", band, ProtobufBuilder.GlobalEqBands);
+                return false;
+            }
+
+            List<ParamWrite> writes = [];
+            if (gain.HasValue) writes.Add(new ParamWrite(0, gain.Value));
+            if (frequency.HasValue) writes.Add(new ParamWrite(1, frequency.Value));
+            if (q.HasValue) writes.Add(new ParamWrite(2, q.Value));
+            if (filterType.HasValue) writes.Add(new ParamWrite(3, filterType.Value));
+            if (enabled.HasValue) writes.Add(new ParamWrite(4, enabled.Value ? 1f : 0f));
+
+            if (writes.Count == 0)
+            {
+                _logger.LogWarning("[ProtocolService] StreamGlobalEqBand needs at least one control (gain/frequency/q/filterType/enabled)");
+                return false;
+            }
+
+            bool ok = true;
+            foreach (ParamWrite write in writes)
+            {
+                int paramIndex = ProtobufBuilder.GlobalEqBandParamIndex(band, write.Offset);
+                byte[] message = ProtobufBuilder.BuildGlobalEqParamMessage(paramIndex, write.Value);
+                ok &= SendCommand(message, MessageTypes.GlobalEQ);
+            }
+            return ok;
         }
 
         /// <summary>
@@ -2267,6 +2733,16 @@ namespace OpenCortex.CortexUSB
         /// Mirrors pyquadcortex's <c>restore_audio()</c>. There is no message that
         /// closes the tuner from the host — only a person on the unit can do that
         /// losslessly (keeping the preference intact for next time).
+        ///
+        /// This is not a workaround pending a real fix — it IS the fix.
+        /// <c>MessageTypes.ShowTuner</c> (27) looked like the obvious candidate
+        /// (a message literally named "show tuner", never sent by this codebase)
+        /// but pyquadcortex field-measured <c>ShowTunerMessage{show}</c> in both
+        /// directions on real hardware: it displays nothing, engages nothing, and
+        /// does not release the engaged-tuner state either. A packet capture of a
+        /// physical tuner close on the unit showed it broadcasts nothing at all —
+        /// no host message opens or closes the tuner on this firmware, so there
+        /// is nothing left to build here beyond this mitigation.
         /// </summary>
         public async Task<bool> RestoreAudioAsync()
         {
@@ -2282,6 +2758,28 @@ namespace OpenCortex.CortexUSB
 
             _logger.LogInformation("[ProtocolService] Restoring audio — clearing tuner mute preference");
             return await SetTunerMuteAsync(false);
+        }
+
+        /// <summary>
+        /// Toggles the manual's "LIVE TUNER" live-pitch stream.
+        ///
+        /// CONFIRMED via a real USB capture: this write DOES take, contradicting
+        /// this project's earlier "confirmed not writable" finding (see
+        /// ProtobufBuilder.BuildTunerMeterEnableMessage for the full story - in
+        /// short, the device never echoes enable_meter back, so the old
+        /// echo-wait check always timed out). Fire-and-forget like
+        /// SetIoMeterSubscribed/SetCpuLoadSubscribed: there is no reliable echo
+        /// to wait for, so success is judged by whether TunerState.Meter starts
+        /// moving, not by a device confirmation here.
+        ///
+        /// Same invisible-engage warning as SetTunerInputAsync/SetTunerMuteAsync
+        /// applies: this also engages the tuner, silencing outputs if the mute
+        /// preference is already on.
+        /// </summary>
+        public bool SetTunerMeterEnabled(bool enable)
+        {
+            if (!_isConnected) return LogNotConnected("set tuner meter enabled");
+            return SendCommand(ProtobufBuilder.BuildTunerMeterEnableMessage(enable), MessageTypes.Tuner);
         }
 
         private static bool GlobalEqEchoConfirmsParam(byte[] payload, int paramIndex, float value)
@@ -2392,6 +2890,167 @@ namespace OpenCortex.CortexUSB
                 _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (param)");
             }
             return false;
+        }
+
+        /// <summary>
+        /// Whether a Grid echo confirms param [row][col][paramIndex] carries more
+        /// than one value (scene-assigned) or exactly one (not) matching
+        /// <paramref name="assigned"/>. See <see cref="SetBlockParameterSceneAssignedAsync"/>.
+        /// </summary>
+        private bool GridEchoConfirmsParamSceneAssigned(byte[] payload, int row, int col, int paramIndex, bool assigned)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                for (int i = 0; i < msg.Preset.Chains.Count; i++)
+                {
+                    Chain ch = msg.Preset.Chains[i];
+                    if ((ch.HasRow ? ch.Row : (uint)i) != row) continue;
+                    for (int j = 0; j < ch.Models.Count; j++)
+                    {
+                        Model mdl = ch.Models[j];
+                        if ((mdl.HasColumn ? mdl.Column : (uint)j) != col) continue;
+                        foreach (Param p in mdl.Params)
+                        {
+                            if (p.HasIndex && p.Index != paramIndex) continue;
+                            if (p.ParamValues.Count == 0) continue;
+                            return (p.ParamValues.Count > 1) == assigned;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (param scene-assignment)");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Whether a Grid echo confirms param [row][col][paramIndex]'s value AT A
+        /// SPECIFIC scene index (not just index 0, unlike <see cref="GridEchoConfirmsParam"/>)
+        /// equals <paramref name="value"/>. See <see cref="SetBlockParameterSceneValueAsync"/>.
+        /// </summary>
+        private bool GridEchoConfirmsParamAtIndex(byte[] payload, int row, int col, int paramIndex, int valueIndex, float value)
+        {
+            try
+            {
+                GridMessage msg = GridMessage.Parser.ParseFrom(payload);
+                for (int i = 0; i < msg.Preset.Chains.Count; i++)
+                {
+                    Chain ch = msg.Preset.Chains[i];
+                    if ((ch.HasRow ? ch.Row : (uint)i) != row) continue;
+                    for (int j = 0; j < ch.Models.Count; j++)
+                    {
+                        Model mdl = ch.Models[j];
+                        if ((mdl.HasColumn ? mdl.Column : (uint)j) != col) continue;
+                        foreach (Param p in mdl.Params)
+                        {
+                            if (p.HasIndex && p.Index != paramIndex) continue;
+                            if (p.ParamValues.Count <= valueIndex) continue;
+                            ParamValue v = p.ParamValues[valueIndex];
+                            if (v.HasFloatValue) return Math.Abs(v.FloatValue - value) < 0.001f;
+                            if (v.HasIntValue) return v.IntValue == (int)value;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing grid echo (param scene value)");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The model hash cached at [row][col] in the last-known preset state, or
+        /// null if the cell is empty/unknown. Used by <see cref="MoveBlockAsync"/>
+        /// to decide whether a destination is occupied (swap) or empty (plain move).
+        /// </summary>
+        private uint? GetCachedModelHash(int row, int col)
+        {
+            if (_currentPreset == null) return null;
+            for (int i = 0; i < _currentPreset.Chains.Count; i++)
+            {
+                Chain ch = _currentPreset.Chains[i];
+                if ((ch.HasRow ? ch.Row : (uint)i) != row) continue;
+                for (int j = 0; j < ch.Models.Count; j++)
+                {
+                    Model mdl = ch.Models[j];
+                    if ((mdl.HasColumn ? mdl.Column : (uint)j) != col) continue;
+                    return mdl.HasHash ? mdl.Hash : null;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Removes and returns the Model cached at [row][col], or null if there
+        /// isn't one. Used to optimistically apply a move/swap locally — see
+        /// <see cref="MoveBlockAsync"/> — since no device echo confirms one.
+        ///
+        /// FIELD-CONFIRMED BUG, now fixed: removing an entry from the middle of
+        /// a chain's Models list shifts every later entry's list index down by
+        /// one. Any of those siblings that lack an explicit Column (relying on
+        /// the "HasColumn ? Column : positional index" fallback used throughout
+        /// this file, e.g. GetCachedModelHash/GridEchoConfirmsBlock/Bypass
+        /// matching) then silently changes IDENTITY out from under it — observed
+        /// live as two completely different, untouched blocks appearing to swap
+        /// bypass state after an unrelated block was moved out from between
+        /// them. Fixed by pinning every sibling's Column explicitly before the
+        /// removal, so a later index shift can no longer change what a
+        /// column-less entry resolves to.
+        /// </summary>
+        private Model? ExtractModelAt(int row, int col)
+        {
+            if (_currentPreset == null) return null;
+            for (int i = 0; i < _currentPreset.Chains.Count; i++)
+            {
+                Chain ch = _currentPreset.Chains[i];
+                if ((ch.HasRow ? ch.Row : (uint)i) != row) continue;
+                for (int k = 0; k < ch.Models.Count; k++)
+                {
+                    if (!ch.Models[k].HasColumn) ch.Models[k].Column = (uint)k;
+                }
+                for (int j = 0; j < ch.Models.Count; j++)
+                {
+                    if (ch.Models[j].Column != col) continue;
+                    Model mdl = ch.Models[j];
+                    ch.Models.RemoveAt(j);
+                    return mdl;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Places <paramref name="model"/> at [row][col] in the cached preset,
+        /// setting its column explicitly (removing any prior column-presence
+        /// ambiguity) and replacing whatever was already at that cell, if
+        /// anything. Creates the row's chain if it isn't cached yet (shouldn't
+        /// normally happen — all 4 rows are always present). Counterpart to
+        /// <see cref="ExtractModelAt"/>.
+        /// </summary>
+        private void PlaceModelAt(int row, int col, Model model)
+        {
+            if (_currentPreset == null) return;
+            model.Column = (uint)col;
+            for (int i = 0; i < _currentPreset.Chains.Count; i++)
+            {
+                Chain ch = _currentPreset.Chains[i];
+                if ((ch.HasRow ? ch.Row : (uint)i) != row) continue;
+                for (int j = 0; j < ch.Models.Count; j++)
+                {
+                    if ((ch.Models[j].HasColumn ? ch.Models[j].Column : (uint)j) != col) continue;
+                    ch.Models[j] = model;
+                    return;
+                }
+                ch.Models.Add(model);
+                return;
+            }
+            Chain newChain = new() { Row = (uint)row };
+            newChain.Models.Add(model);
+            _currentPreset.Chains.Add(newChain);
         }
 
         /// <summary>
@@ -2667,6 +3326,9 @@ namespace OpenCortex.CortexUSB
                 MessageTypes.GlobalEQ => HandleGlobalEqMessage(message),
                 MessageTypes.MasterVolume => HandleMasterVolumeMessage(message),
                 MessageTypes.Tuner => HandleTunerMessage(message),
+                MessageTypes.IOMeter => HandleIoMeterMessage(message),
+                MessageTypes.CPULoad => HandleCpuLoadMessage(message),
+                MessageTypes.GridModelMeter => HandleGridModelMeterMessage(message),
                 _ => HandleUnknownMessage(message)
             };
         }
@@ -2751,22 +3413,125 @@ namespace OpenCortex.CortexUSB
                 // input). Caching that raw would poison every future state broadcast: once
                 // an Infinity lands in _currentState, System.Text.Json refuses to serialize
                 // any message containing it, and clients silently stop getting responses.
+                // Same guard applies to meter, which IS confirmed live now (see
+                // ProtobufBuilder.BuildTunerMeterEnableMessage) - real Hz values that sweep
+                // continuously while a string is tuned.
                 bool validFrequency = msg.HasFrequency && float.IsFinite(msg.Frequency);
+                bool validMeter = msg.HasMeter && float.IsFinite(msg.Meter);
+                // The device never echoes enable_meter back on the messages that carry meter
+                // values (confirmed via capture: every streamed meter push omits field 6
+                // entirely). So the field's mere PRESENCE, not just its value, has to drive
+                // EnableMeter here - an explicit push wins when present, otherwise a meter
+                // value arriving at all is itself proof the live tuner is engaged.
                 TunerState updated = current with
                 {
                     InputPortId = msg.HasInputPortId ? msg.InputPortId : current.InputPortId,
                     Mute = msg.HasMute ? msg.Mute : current.Mute,
-                    Frequency = validFrequency ? msg.Frequency : current.Frequency
+                    Frequency = validFrequency ? msg.Frequency : current.Frequency,
+                    EnableMeter = msg.HasEnableMeter ? msg.EnableMeter : (validMeter || current.EnableMeter),
+                    Meter = validMeter ? msg.Meter : current.Meter
                 };
                 if (updated == current) return false;
 
                 _currentState = _currentState with { Tuner = updated, Timestamp = DateTime.UtcNow };
-                _logger.LogDebug("[ProtocolService] Tuner state updated: input={InputPortId}, mute={Mute}", updated.InputPortId, updated.Mute);
+                _logger.LogDebug("[ProtocolService] Tuner state updated: input={InputPortId}, mute={Mute}, enableMeter={EnableMeter}, meter={Meter}", updated.InputPortId, updated.Mute, updated.EnableMeter, updated.Meter);
                 return true;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[ProtocolService] Error parsing Tuner message");
+                return false;
+            }
+        }
+
+        private bool HandleIoMeterMessage(WirePayload message)
+        {
+            try
+            {
+                IOMeterMessage msg = IOMeterMessage.Parser.ParseFrom(message.Payload);
+                IoMeterState current = _currentState.IoMeter;
+                IoMeterState updated = current with
+                {
+                    Input1 = msg.HasInput1 ? msg.Input1 : current.Input1,
+                    Input2 = msg.HasInput2 ? msg.Input2 : current.Input2,
+                    Return1 = msg.HasReturn1 ? msg.Return1 : current.Return1,
+                    Return2 = msg.HasReturn2 ? msg.Return2 : current.Return2,
+                    Xlr1 = msg.HasXlr1 ? msg.Xlr1 : current.Xlr1,
+                    Xlr1Limiter = msg.HasXlr1Limiter ? msg.Xlr1Limiter : current.Xlr1Limiter,
+                    Xlr2 = msg.HasXlr2 ? msg.Xlr2 : current.Xlr2,
+                    Xlr2Limiter = msg.HasXlr2Limiter ? msg.Xlr2Limiter : current.Xlr2Limiter,
+                    Out3 = msg.HasOut3 ? msg.Out3 : current.Out3,
+                    Out3Limiter = msg.HasOut3Limiter ? msg.Out3Limiter : current.Out3Limiter,
+                    Out4 = msg.HasOut4 ? msg.Out4 : current.Out4,
+                    Out4Limiter = msg.HasOut4Limiter ? msg.Out4Limiter : current.Out4Limiter,
+                    Send1 = msg.HasSend1 ? msg.Send1 : current.Send1,
+                    Send2 = msg.HasSend2 ? msg.Send2 : current.Send2,
+                    HpL = msg.HasHpL ? msg.HpL : current.HpL,
+                    HpR = msg.HasHpR ? msg.HpR : current.HpR,
+                    HpLimiterActive = msg.HasHpLimiterActive ? msg.HpLimiterActive : current.HpLimiterActive,
+                    GridXlr1 = msg.HasGridXlr1 ? msg.GridXlr1 : current.GridXlr1,
+                    GridXlr2 = msg.HasGridXlr2 ? msg.GridXlr2 : current.GridXlr2,
+                    GridOut3 = msg.HasGridOut3 ? msg.GridOut3 : current.GridOut3,
+                    GridOut4 = msg.HasGridOut4 ? msg.GridOut4 : current.GridOut4,
+                    GridSend1 = msg.HasGridSend1 ? msg.GridSend1 : current.GridSend1,
+                    GridSend2 = msg.HasGridSend2 ? msg.GridSend2 : current.GridSend2
+                };
+                if (updated == current) return false;
+
+                _currentState = _currentState with { IoMeter = updated, Timestamp = DateTime.UtcNow };
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing IOMeter message");
+                return false;
+            }
+        }
+
+        private bool HandleCpuLoadMessage(WirePayload message)
+        {
+            try
+            {
+                CPULoadMessage msg = CPULoadMessage.Parser.ParseFrom(message.Payload);
+                List<List<float>> chains = msg.Chains
+                    .Select(chain => chain.Columns.Select(c => c.CpuLoad).ToList())
+                    .ToList();
+                CpuLoadState updated = new()
+                {
+                    TotalLoad = msg.HasCpuTotalLoad ? msg.CpuTotalLoad : _currentState.CpuLoad.TotalLoad,
+                    Chains = chains.Count > 0 ? chains : _currentState.CpuLoad.Chains
+                };
+                if (updated == _currentState.CpuLoad) return false;
+
+                _currentState = _currentState with { CpuLoad = updated, Timestamp = DateTime.UtcNow };
+                _logger.LogDebug("[ProtocolService] CPU load updated: total={Total}, chains={ChainCount}", updated.TotalLoad, updated.Chains.Count);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing CPULoad message");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// The response shape (if any) to a GridModelMeter subscribe is totally
+        /// unknown - logs everything at Information level (louder than the usual
+        /// Debug) so any echo is easy to spot while testing SubscribeGridModelMeter.
+        /// </summary>
+        private bool HandleGridModelMeterMessage(WirePayload message)
+        {
+            try
+            {
+                GridModelMeterMessage msg = GridModelMeterMessage.Parser.ParseFrom(message.Payload);
+                _logger.LogInformation(
+                    "[ProtocolService] GridModelMeter message: action={Action}, row={Row}, col={Col}, raw={Payload}",
+                    msg.Action, msg.HasRow ? msg.Row : -1, msg.HasColumn ? msg.Column : -1, Convert.ToHexString(message.Payload));
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ProtocolService] Error parsing GridModelMeter message - raw payload: {Payload}", Convert.ToHexString(message.Payload));
                 return false;
             }
         }
@@ -3530,6 +4295,23 @@ namespace OpenCortex.CortexUSB
                 float max = def?.Max ?? (param.HasExpressionMax ? param.ExpressionMax : 1f);
                 ParamType paramType = def?.ParamType ?? ParamType.Unknown;
 
+                // Regression found: this used to be `param.ParamValues.Count > 1`,
+                // which broke ordinary (non-scene) parameter edits entirely — the
+                // device apparently reports more than one ParamValue for reasons
+                // unrelated to Scene assignment (possibly always sending a
+                // fixed-size array), so that heuristic false-positived on
+                // everyday parameters. Those then routed into
+                // SetBlockParameterSceneValueAsync, which refuses to write at all
+                // unless SceneValues.Count==8 — silently blocking the write with
+                // no wire traffic sent, matching the "can't change parameters"
+                // report. The explicit `scene_mode` flag (set by
+                // BuildGridParamSceneValuesMessage's writes) is the only signal
+                // that's actually about Scene assignment specifically.
+                bool sceneAssigned = param.HasSceneMode && param.SceneMode;
+                List<float> sceneValues = sceneAssigned && param.ParamValues.Count > 1
+                    ? param.ParamValues.Select(pv => TryGetParamValue(pv, out float v) ? v : 0f).ToList()
+                    : [];
+
                 parameters.Add(new BlockParam
                 {
                     Index = index,
@@ -3537,7 +4319,9 @@ namespace OpenCortex.CortexUSB
                     Value = value,
                     Min = min,
                     Max = max,
-                    ParamType = paramType
+                    ParamType = paramType,
+                    SceneAssigned = sceneAssigned,
+                    SceneValues = sceneValues
                 });
             }
 

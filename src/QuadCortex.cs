@@ -82,11 +82,27 @@ namespace OpenCortex.CortexUSB
         public Task<bool> SetBlockParameterAsync(int row, int col, int paramIndex, float value)
             => _service.SetBlockParameterAsync(row, col, paramIndex, value);
 
+        public Task<bool> SetBlockParameterSceneAssignedAsync(int row, int col, int paramIndex, bool assign)
+            => _service.SetBlockParameterSceneAssignedAsync(row, col, paramIndex, assign);
+
+        public Task<bool> SetBlockParameterSceneValueAsync(int row, int col, int paramIndex, int sceneIndex, float value)
+            => _service.SetBlockParameterSceneValueAsync(row, col, paramIndex, sceneIndex, value);
+
+        public bool StreamBlockParameter(int row, int col, int paramIndex, float value)
+            => _service.StreamBlockParameter(row, col, paramIndex, value);
+
+        public bool StreamBlockParameterSceneValue(int row, int col, int paramIndex, int sceneIndex, float value)
+            => _service.StreamBlockParameterSceneValue(row, col, paramIndex, sceneIndex, value);
+
         public Task<bool> SetBlockAsync(int row, int col, uint modelHash)
             => _service.SetBlockAsync(row, col, modelHash);
 
         public Task<bool> RemoveBlockAsync(int row, int col)
             => _service.RemoveBlockAsync(row, col);
+
+        /// <summary>Moves a block from one grid cell to another. A cross-row move creates a parallel path (branch).</summary>
+        public Task<bool> MoveBlockAsync(int fromRow, int fromCol, int toRow, int toCol)
+            => _service.MoveBlockAsync(fromRow, fromCol, toRow, toCol);
 
         public Task<bool> SetChainInputAsync(int row, uint inPortId)
             => _service.SetChainInputAsync(row, inPortId);
@@ -168,6 +184,10 @@ namespace OpenCortex.CortexUSB
             float? q = null, float? filterType = null, bool? enabled = null)
             => _service.SetGlobalEqBandAsync(band, gain, frequency, q, filterType, enabled);
 
+        public bool StreamGlobalEqBand(int band, float? gain = null, float? frequency = null,
+            float? q = null, float? filterType = null, bool? enabled = null)
+            => _service.StreamGlobalEqBand(band, gain, frequency, q, filterType, enabled);
+
         public Task<bool> SetGlobalEqOutputAsync(float? level = null, bool? out12 = null, bool? out34 = null)
             => _service.SetGlobalEqOutputAsync(level, out12, out34);
 
@@ -186,8 +206,20 @@ namespace OpenCortex.CortexUSB
         public Task<bool> RestoreAudioAsync()
             => _service.RestoreAudioAsync();
 
+        public bool SetTunerMeterEnabled(bool enable)
+            => _service.SetTunerMeterEnabled(enable);
+
         public bool RequestGlobalControlsRefresh()
             => _service.RequestGlobalControlsRefresh();
+
+        public bool SetIoMeterSubscribed(bool subscribe)
+            => _service.SetIoMeterSubscribed(subscribe);
+
+        public bool SetCpuLoadSubscribed(bool subscribe)
+            => _service.SetCpuLoadSubscribed(subscribe);
+
+        public bool SubscribeGridModelMeter(int row, int column, int action)
+            => _service.SubscribeGridModelMeter(row, column, action);
 
         // ─── Preset library (cached, with device fallback) ─────────────
 

@@ -30,6 +30,8 @@ namespace OpenCortex.CortexUSB.Models
         public GlobalEqState? GlobalEq { get; init; }
         public MasterVolumeState? MasterVolume { get; init; }
         public TunerState? Tuner { get; init; }
+        public IoMeterState? IoMeter { get; init; }
+        public CpuLoadState? CpuLoad { get; init; }
 
         public string ModeName => DeviceMode.GetModeName(Mode);
     }

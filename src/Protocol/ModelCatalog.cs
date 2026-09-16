@@ -34,26 +34,36 @@ namespace OpenCortex.CortexUSB.Protocol
 
         public static Dictionary<int, ModelInfo> Parse(byte[] modelRepoPayload)
         {
-            if (modelRepoPayload.Length == 0)
-            {
-                return [];
-            }
-
-            byte[] data = CompressionUtils.DecompressIfNeeded(modelRepoPayload);
-            ModelRepoMessage repoMessage = ModelRepoMessage.Parser.ParseFrom(data);
-            if (repoMessage.ModelRepoPayload.IsEmpty)
-            {
-                return [];
-            }
-
-            byte[] repoBytes = CompressionUtils.DecompressIfNeeded(repoMessage.ModelRepoPayload.ToByteArray());
-            string? xml = ExtractXmlFromTar(repoBytes);
+            string? xml = ExtractXml(modelRepoPayload);
             if (string.IsNullOrWhiteSpace(xml))
             {
                 return [];
             }
 
             return ParseModelRepoXml(xml);
+        }
+
+        /// <summary>
+        /// Unwraps a raw ModelRepo payload (as received over the wire) down to the
+        /// underlying XML catalog, without parsing it into <see cref="ModelInfo"/>
+        /// records. Useful for inspecting the device's raw model/parameter definitions.
+        /// </summary>
+        public static string? ExtractXml(byte[] modelRepoPayload)
+        {
+            if (modelRepoPayload.Length == 0)
+            {
+                return null;
+            }
+
+            byte[] data = CompressionUtils.DecompressIfNeeded(modelRepoPayload);
+            ModelRepoMessage repoMessage = ModelRepoMessage.Parser.ParseFrom(data);
+            if (repoMessage.ModelRepoPayload.IsEmpty)
+            {
+                return null;
+            }
+
+            byte[] repoBytes = CompressionUtils.DecompressIfNeeded(repoMessage.ModelRepoPayload.ToByteArray());
+            return ExtractXmlFromTar(repoBytes);
         }
 
         private static string? ExtractXmlFromTar(byte[] tarData)
@@ -114,6 +124,7 @@ namespace OpenCortex.CortexUSB.Protocol
             string currentCategory = string.Empty;
             int? currentModelId = null;
             string currentModelName = string.Empty;
+            string currentModelBasedOn = string.Empty;
             List<ParamDef> currentParams = new();
 
             while (reader.Read())
@@ -128,6 +139,7 @@ namespace OpenCortex.CortexUSB.Protocol
                         case "Model":
                             currentModelId = reader.GetAttribute("id")?.ToIntOrNull();
                             currentModelName = reader.GetAttribute("name") ?? string.Empty;
+                            currentModelBasedOn = reader.GetAttribute("tm") ?? string.Empty;
                             currentParams = [];
                             break;
                         case "Parameter":
@@ -164,6 +176,7 @@ namespace OpenCortex.CortexUSB.Protocol
                             {
                                 Name = currentModelName,
                                 Category = currentCategory,
+                                BasedOn = currentModelBasedOn,
                                 ParamDefs = currentParams.ToList()
                             };
                         }

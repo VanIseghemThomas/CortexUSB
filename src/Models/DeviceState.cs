@@ -210,6 +210,25 @@ namespace OpenCortex.CortexUSB.Models
 
         [JsonPropertyName("paramType")]
         public ParamType ParamType { get; init; } = ParamType.Unknown;
+
+        /// <summary>
+        /// The manual's "SCENE ASSIGNMENTS" feature: "tap and hold a parameter to
+        /// assign or unassign it to Scenes. Once assigned, the parameter's value
+        /// will be stored independently for each Scene." True when the device
+        /// carries more than one ParamValue for this parameter (one per scene, A-H).
+        /// </summary>
+        [JsonPropertyName("sceneAssigned")]
+        public bool SceneAssigned { get; init; }
+
+        /// <summary>
+        /// The 8 per-scene values (A-H, index 0-7) when <see cref="SceneAssigned"/>
+        /// is true; empty otherwise. <see cref="Value"/> above is always just
+        /// SceneValues[currentScene] (or the single shared value when not
+        /// scene-assigned) - this is the full array, for editing every scene's
+        /// value rather than only whichever one is currently active.
+        /// </summary>
+        [JsonPropertyName("sceneValues")]
+        public List<float> SceneValues { get; init; } = [];
     }
 
     public enum ParamType
@@ -245,6 +264,14 @@ namespace OpenCortex.CortexUSB.Models
 
         [JsonPropertyName("category")]
         public string Category { get; init; } = string.Empty;
+
+        /// <summary>
+        /// The device's own "based on" attribution for modeled gear (e.g. "Based on
+        /// Ibanez® TS808®"), taken from the ModelRepo XML's <c>tm</c> attribute. Empty
+        /// for models that aren't based on a specific piece of hardware.
+        /// </summary>
+        [JsonPropertyName("basedOn")]
+        public string BasedOn { get; init; } = string.Empty;
 
         [JsonPropertyName("paramDefs")]
         public List<ParamDef> ParamDefs { get; init; } = [];
@@ -371,6 +398,140 @@ namespace OpenCortex.CortexUSB.Models
 
         [JsonPropertyName("frequency")]
         public float Frequency { get; init; }
+
+        /// <summary>
+        /// The manual's "LIVE TUNER" toggle (Tuner menu -> LIVE TUNER: "Toggles
+        /// the LIVE TUNER in Gig View" - a moving pitch indicator, confirmed by
+        /// the user to keep updating even away from the Tuner/Gig View screens,
+        /// not just while looking at it).
+        ///
+        /// CORRECTED FINDING (previously "confirmed not writable" - that was
+        /// wrong): a real USB capture of the official app shows it writes
+        /// {action=Update, request_id, enable_meter=true} to turn this on, and
+        /// <see cref="Meter"/> starts streaming real Hz values right after. The
+        /// earlier refusal conclusion was a measurement artifact - the device
+        /// never echoes enable_meter back on any later message (not even the
+        /// immediate Read response), so the old code's echo-wait always timed
+        /// out and looked like a refusal. See
+        /// ProtocolService.SetTunerMeterEnabled /
+        /// ProtobufBuilder.BuildTunerMeterEnableMessage for the write path, and
+        /// ProtocolService.HandleTunerMessage for why this field is inferred
+        /// from a meter value arriving at all rather than trusted only when the
+        /// device explicitly asserts it (which it usually doesn't).
+        /// </summary>
+        [JsonPropertyName("enableMeter")]
+        public bool EnableMeter { get; init; }
+
+        /// <summary>
+        /// The live pitch reading LIVE TUNER drives (see <see cref="EnableMeter"/>).
+        /// CONFIRMED via a real USB capture: this is a real, continuously-updating
+        /// frequency in Hz (observed sweeping through plausible guitar-string
+        /// values, e.g. ~77-330 Hz, while a string was being tuned) - not an
+        /// unconfirmed/never-observed field as earlier assumed.
+        /// </summary>
+        [JsonPropertyName("meter")]
+        public float Meter { get; init; }
+    }
+
+    /// <summary>
+    /// I/O level meters. Populated from IOMeter (type 5) pushes.
+    ///
+    /// UNCONFIRMED against hardware: MessageTypes.IOMeter was previously a
+    /// declared-but-dead constant (nothing ever sent or subscribed to it). This
+    /// mirrors the GlobalEQ/MasterVolume/Tuner "push-only field" pattern (see
+    /// ProtocolService.RequestGlobalControlsRefresh) - a single Read query is
+    /// sent once and the device is assumed to keep pushing updates on its own
+    /// from there. Verify on the unit that levels actually keep moving after
+    /// the initial request.
+    ///
+    /// Field names/units match the wire message directly (0.0-1.0 range,
+    /// presumed linear amplitude rather than dB - unconfirmed).
+    /// </summary>
+    public record IoMeterState
+    {
+        [JsonPropertyName("input1")]
+        public float Input1 { get; init; }
+
+        [JsonPropertyName("input2")]
+        public float Input2 { get; init; }
+
+        [JsonPropertyName("return1")]
+        public float Return1 { get; init; }
+
+        [JsonPropertyName("return2")]
+        public float Return2 { get; init; }
+
+        [JsonPropertyName("xlr1")]
+        public float Xlr1 { get; init; }
+
+        [JsonPropertyName("xlr1Limiter")]
+        public float Xlr1Limiter { get; init; }
+
+        [JsonPropertyName("xlr2")]
+        public float Xlr2 { get; init; }
+
+        [JsonPropertyName("xlr2Limiter")]
+        public float Xlr2Limiter { get; init; }
+
+        [JsonPropertyName("out3")]
+        public float Out3 { get; init; }
+
+        [JsonPropertyName("out3Limiter")]
+        public float Out3Limiter { get; init; }
+
+        [JsonPropertyName("out4")]
+        public float Out4 { get; init; }
+
+        [JsonPropertyName("out4Limiter")]
+        public float Out4Limiter { get; init; }
+
+        [JsonPropertyName("send1")]
+        public float Send1 { get; init; }
+
+        [JsonPropertyName("send2")]
+        public float Send2 { get; init; }
+
+        [JsonPropertyName("hpL")]
+        public float HpL { get; init; }
+
+        [JsonPropertyName("hpR")]
+        public float HpR { get; init; }
+
+        [JsonPropertyName("hpLimiterActive")]
+        public bool HpLimiterActive { get; init; }
+
+        [JsonPropertyName("gridXlr1")]
+        public float GridXlr1 { get; init; }
+
+        [JsonPropertyName("gridXlr2")]
+        public float GridXlr2 { get; init; }
+
+        [JsonPropertyName("gridOut3")]
+        public float GridOut3 { get; init; }
+
+        [JsonPropertyName("gridOut4")]
+        public float GridOut4 { get; init; }
+
+        [JsonPropertyName("gridSend1")]
+        public float GridSend1 { get; init; }
+
+        [JsonPropertyName("gridSend2")]
+        public float GridSend2 { get; init; }
+    }
+
+    /// <summary>
+    /// The desktop app's "CPU Monitor" feature: per-block CPU load, indexed
+    /// [row][column] to match the grid. Populated from CPULoad (type 26)
+    /// pushes. UNCONFIRMED whether a plain Read query is enough to start this
+    /// streaming - see MessageTypes.CPULoad and ProtocolService.RequestCpuLoadRefresh.
+    /// </summary>
+    public record CpuLoadState
+    {
+        [JsonPropertyName("totalLoad")]
+        public float TotalLoad { get; init; }
+
+        [JsonPropertyName("chains")]
+        public List<List<float>> Chains { get; init; } = [];
     }
 
     /// <summary>
@@ -415,6 +576,12 @@ namespace OpenCortex.CortexUSB.Models
         [JsonPropertyName("tuner")]
         public TunerState Tuner { get; init; } = new();
 
+        [JsonPropertyName("ioMeter")]
+        public IoMeterState IoMeter { get; init; } = new();
+
+        [JsonPropertyName("cpuLoad")]
+        public CpuLoadState CpuLoad { get; init; } = new();
+
         [JsonPropertyName("timestamp")]
         public DateTime Timestamp { get; init; } = DateTime.UtcNow;
     }
@@ -457,9 +624,53 @@ namespace OpenCortex.CortexUSB.Models
     {
         public const uint Grid = 1;
         public const uint SetlistPosition = 2;
+        public const uint GridMove = 12;
         public const uint File = 4;
         public const uint IOMeter = 5;
         public const uint Tuner = 6;
+
+        /// <summary>
+        /// The desktop app's manual-documented "CPU Monitor" toggle ("displays
+        /// overall CPU usage per device block") lives here. Unlike IOMeter, this
+        /// has never been sent by this codebase either - added alongside IOMeter
+        /// specifically to test whether a plain Read unlocks per-block telemetry
+        /// here where it didn't for IOMeter, since CPULoadMessage has no
+        /// enable/gate field of its own (just the same action field every other
+        /// subsystem uses) and CPU load is comparatively cheap for the device to
+        /// compute continuously regardless of what's tapping it.
+        /// </summary>
+        public const uint CPULoad = 26;
+
+        /// <summary>
+        /// Confirmed real and used by the official app via a `strings` pass over
+        /// its binary: `neural::cortex::common::GridModelMeterMessageSender`
+        /// exists, and a demangled lambda name reveals
+        /// `GridModelMeterMessageSender::getMeterMessageBuilder(int, int)` -
+        /// almost certainly (row, column), matching this message's only two
+        /// meaningful fields. UNCONFIRMED what action/response shape actually
+        /// subscribes a cell's live meter - see BuildGridModelMeterSubscribeMessage.
+        /// </summary>
+        public const uint GridModelMeter = 37;
+
+        /// <summary>
+        /// CONFIRMED DISRUPTIVE on hardware: sending ProductionAutomationModeMessage
+        /// {enable=true} on this type drops the WebHID connection outright. Tried
+        /// it as a hoped-for "enable telemetry" gate for IOMeter/GridModelMeter -
+        /// it is not a harmless toggle.
+        ///
+        /// CONFIRMED IRRELEVANT to that goal, separately: a `strings` pass over
+        /// the real Cortex Control app binary (v4.1.0, both the x86_64 and arm64
+        /// slices) shows every one of its ~55 other message types has a
+        /// `neural::cortex::common::<Type>MessageSender` and/or
+        /// `neural::cortex::usb::<Type>MessageReceiver` class (109 such classes
+        /// total, e.g. `IOMeterMessageSender`/`IOMeterMessageReceiver` and
+        /// `GridModelMeterMessageSender` both genuinely exist) - but NEITHER
+        /// class exists for ProductionAutomationMode. The official app never
+        /// sends or receives this message at all. Whatever it is, it is not
+        /// part of the normal metering/telemetry path and there is no reason
+        /// left to keep testing it for that purpose - do not send it again.
+        /// </summary>
+        public const uint ProductionAutomationMode = 11;
         public const uint Version = 10;
         public const uint Scene = 13;
         public const uint Mode = 14;

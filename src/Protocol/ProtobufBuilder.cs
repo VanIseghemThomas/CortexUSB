@@ -71,6 +71,55 @@ namespace OpenCortex.CortexUSB.Protocol
         }
 
         /// <summary>
+        /// Build a subscribe/unsubscribe message for a live-telemetry subsystem
+        /// that shares the common {action, request_id} field layout (field 1,
+        /// field 2 - same generic-container trick as BuildStateQuery, since the
+        /// wire bytes only depend on those two fields regardless of which actual
+        /// message type encodes them). CONFIRMED via a real USB capture of the
+        /// official app: IOMeter (type 5) and CPULoad (type 26) are NOT started
+        /// by a plain Read - the app sends Create (the default when action is
+        /// simply omitted from the wire, since MessageAction has no `optional`)
+        /// with a request_id to start streaming, and Delete with a request_id to
+        /// stop it. A plain Read, which this project used for both since it
+        /// matches the pattern for every other subsystem (GlobalEQ, MasterVolume,
+        /// Tuner), was confirmed to produce nothing for either.
+        /// </summary>
+        public static byte[] BuildMeterSubscribeMessage(bool subscribe, ulong requestId = 1)
+        {
+            SceneMessage message = new()
+            {
+                Action = subscribe ? MessageAction.Types.Enum.Create : MessageAction.Types.Enum.Delete,
+                RequestId = requestId
+            };
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a GridModelMeter message (type 37) targeting one grid cell.
+        /// Confirmed real (see MessageTypes.GridModelMeter) but the exact
+        /// subscribe/unsubscribe shape is UNCONFIRMED - the message itself
+        /// carries only {action, row, column}, no explicit enable flag, and a
+        /// Create attempt produced no response and no side effect on other
+        /// meters. <paramref name="action"/> is taken as a raw int (matching
+        /// MessageAction.Enum's wire values 0-8: Create/Update/Delete/Read/
+        /// Move/Copy/Upload/Download/Swap) so every action can be tried from
+        /// the UI without a rebuild between attempts.
+        /// </summary>
+        public static byte[] BuildGridModelMeterSubscribeMessage(int row, int column, int action)
+        {
+            if (row < 0 || row > 3) throw new ArgumentOutOfRangeException(nameof(row), "Row index must be 0-3");
+            if (column < 0 || column > 7) throw new ArgumentOutOfRangeException(nameof(column), "Column index must be 0-7");
+
+            GridModelMeterMessage message = new()
+            {
+                Action = (MessageAction.Types.Enum)action,
+                Row = row,
+                Column = column
+            };
+            return message.ToByteArray();
+        }
+
+        /// <summary>
         /// Build a SetlistPosition message (type 2) for preset switching.
         /// Format: {action=UPDATE, folder_key=setlist_path, position=preset_index, is_factory=is_factory}
         /// </summary>
@@ -312,6 +361,89 @@ namespace OpenCortex.CortexUSB.Protocol
         }
 
         /// <summary>
+        /// Build a Grid message (type 1) writing every value of a Scene-assignable
+        /// parameter at once — the manual's "SCENE ASSIGNMENTS" feature ("tap and
+        /// hold a parameter to assign or unassign it to Scenes").
+        ///
+        /// UNVERIFIED against hardware. Modeled directly on <c>Param.scene_mode</c>
+        /// (field 4) mirroring the exact {array-of-8 + scene_mode bool} shape
+        /// <c>ColBypass</c> uses for per-scene bypass (see the 4-arg overload of
+        /// <see cref="BuildGridBypassMessage(int,int,int,bool)"/>) — but that
+        /// bypass overload turned out to be dead code (never called from
+        /// <c>ProtocolService</c>), so this shape has never actually been proven
+        /// on the wire for ANY field, not just this one. Callers always resend
+        /// every scene's value they already have cached (never just the one
+        /// being changed) specifically so this is safe even if the device turns
+        /// out to replace the whole array rather than patch it by index - the
+        /// deliberate defense against the exact clobber risk the untested bypass
+        /// overload would have carried.
+        ///
+        /// Pass a single-element <paramref name="sceneValues"/> with
+        /// <paramref name="assignToScenes"/> false to unassign (collapse back to
+        /// one shared value) - <c>scene_mode</c> is left UNSET on the wire in that
+        /// case rather than explicitly sent as false, matching the same
+        /// already-confirmed caution as the global (non-scene) bypass write:
+        /// pyquadcortex found some fields silently drop the whole write when a
+        /// bool is sent as an explicit false instead of omitted.
+        /// </summary>
+        public static byte[] BuildGridParamSceneValuesMessage(int rowIndex, int columnIndex, int paramIndex, IReadOnlyList<float> sceneValues, bool assignToScenes)
+        {
+            if (rowIndex < 0 || rowIndex > 3)
+            {
+                throw new ArgumentOutOfRangeException(nameof(rowIndex), "Row index must be 0-3");
+            }
+
+            if (columnIndex < 0 || columnIndex > 11)
+            {
+                throw new ArgumentOutOfRangeException(nameof(columnIndex), "Column index must be 0-11");
+            }
+
+            if (sceneValues.Count == 0)
+            {
+                throw new ArgumentException("At least one value is required", nameof(sceneValues));
+            }
+
+            BinaryPreset preset = new();
+
+            Chain chain = new()
+            {
+                Row = (uint)rowIndex
+            };
+
+            Model model = new()
+            {
+                Column = (uint)columnIndex
+            };
+
+            Param param = new()
+            {
+                Index = (uint)paramIndex
+            };
+
+            if (assignToScenes)
+            {
+                param.SceneMode = true;
+            }
+
+            foreach (float value in sceneValues)
+            {
+                param.ParamValues.Add(new ParamValue { FloatValue = value });
+            }
+
+            model.Params.Add(param);
+            chain.Models.Add(model);
+            preset.Chains.Add(chain);
+
+            GridMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Update,
+                Preset = preset
+            };
+
+            return message.ToByteArray();
+        }
+
+        /// <summary>
         /// Build a Grid message (type 1) placing a block in a grid cell.
         /// Format: GridMessage { action=UPDATE, preset={ chains=[{ row, models=[{ column, hash }] }] } }
         /// Row/column-keyed sparse update — the ONLY shape that persists an edit.
@@ -347,6 +479,26 @@ namespace OpenCortex.CortexUSB.Protocol
             preset.Chains.Add(chain);
 
             return new GridMessage { Action = MessageAction.Types.Enum.Delete, Preset = preset }.ToByteArray();
+        }
+
+        public static byte[] BuildGridMoveMessage(int fromRow, int fromCol, int toRow, int toCol)
+        {
+            if (fromRow < 0 || fromRow > 3) throw new ArgumentOutOfRangeException(nameof(fromRow), "Row index must be 0-3");
+            if (toRow < 0 || toRow > 3) throw new ArgumentOutOfRangeException(nameof(toRow), "Row index must be 0-3");
+            if (fromCol < 0 || fromCol > 7) throw new ArgumentOutOfRangeException(nameof(fromCol), "Column index must be 0-7");
+            if (toCol < 0 || toCol > 7) throw new ArgumentOutOfRangeException(nameof(toCol), "Column index must be 0-7");
+
+            GridMoveMessage message = new();
+            message.Move.Add(new GridMoveElement
+            {
+                FromRow = (uint)fromRow,
+                FromCol = (uint)fromCol,
+                ToRow = (uint)toRow,
+                ToCol = (uint)toCol,
+                IsDrop = true
+            });
+
+            return message.ToByteArray();
         }
 
         /// <summary>
@@ -769,6 +921,33 @@ namespace OpenCortex.CortexUSB.Protocol
         public static byte[] BuildTunerMuteMessage(bool mute)
         {
             TunerMessage message = new() { Action = MessageAction.Types.Enum.Update, Mute = mute };
+            return message.ToByteArray();
+        }
+
+        /// <summary>
+        /// Build a Tuner message (type 6) toggling the manual's "LIVE TUNER"
+        /// live-pitch stream.
+        ///
+        /// CONFIRMED via a real USB capture of the official app: {action=Update,
+        /// request_id, enable_meter} is the correct shape, and it DOES take -
+        /// contradicting this project's own earlier "confirmed not writable"
+        /// finding. That earlier conclusion was a measurement artifact: the
+        /// device never echoes enable_meter back on any later message (not even
+        /// the very next Read), so a write that waited for an echo containing
+        /// HasEnableMeter always timed out and looked refused. The real proof of
+        /// success is the <c>meter</c> field (field 7) itself, which starts
+        /// streaming live pitch data (real Hz values, sweeping as a string is
+        /// tuned) shortly after this message lands - see
+        /// ProtocolService.SetTunerMeterEnabled and TunerState.Meter.
+        /// </summary>
+        public static byte[] BuildTunerMeterEnableMessage(bool enable, ulong requestId = 1)
+        {
+            TunerMessage message = new()
+            {
+                Action = MessageAction.Types.Enum.Update,
+                RequestId = requestId,
+                EnableMeter = enable
+            };
             return message.ToByteArray();
         }
 
